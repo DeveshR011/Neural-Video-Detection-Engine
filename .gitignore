@@ -1,0 +1,55 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Environment
+.env
+venv/
+ENV/
+env/
+.venv/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# PyTorch checkpoints
+checkpoints/
+*.pt
+
+# Dataset files (COCO, etc.)
+coco/
+
+# logs
+*.log
+
+# Generated encryption or binary artifacts
+secure_enclave/detector.enc
+
+# ZIP archives
+*.zip
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# VSCode settings
+.vscode/
+
+# Python virtualenv
+pip-log.txt
+pip-delete-this-directory.txt
+
+# mypy
+.mypy_cache/
+
+# Pyre type checker
+.pyre/

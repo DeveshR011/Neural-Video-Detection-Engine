@@ -1,0 +1,65 @@
+{
+  "latency": {
+    "mean_ms": 2.312,
+    "std_ms": 0.677,
+    "min_ms": 1.27,
+    "max_ms": 3.987,
+    "median_ms": 2.365,
+    "fps": 432.6,
+    "meets_30fps": true,
+    "cv_percent": 29.3
+  },
+  "memory": {
+    "total_parameters": 3274783,
+    "trainable_parameters": 3012639,
+    "frozen_parameters": 262144,
+    "parameter_memory_mb": 12.49,
+    "peak_activation_memory_mb": 25.0,
+    "in_place_activations": true,
+    "intermediate_tensor_zeroing": true
+  },
+  "adversarial_resistance": {
+    "eps_0.01": {
+      "l2_deviation": 0.0055,
+      "cosine_similarity": 1.0,
+      "defended_l2_deviation": 0.0075,
+      "defense_reduction_pct": -35.57
+    },
+    "eps_0.03": {
+      "l2_deviation": 0.0055,
+      "cosine_similarity": 1.0,
+      "defended_l2_deviation": 0.0076,
+      "defense_reduction_pct": -36.72
+    },
+    "eps_0.05": {
+      "l2_deviation": 0.0055,
+      "cosine_similarity": 1.0,
+      "defended_l2_deviation": 0.0076,
+      "defense_reduction_pct": -36.71
+    },
+    "eps_0.1": {
+      "l2_deviation": 0.0056,
+      "cosine_similarity": 1.0,
+      "defended_l2_deviation": 0.0076,
+      "defense_reduction_pct": -36.86
+    }
+  },
+  "extraction_resistance": {
+    "total_monitored_layers": 24,
+    "watermark_detected": false,
+    "watermark_accuracy": 0.4766,
+    "random_projection_active": true,
+    "architecture_morphing_supported": true,
+    "weight_encryption_at_rest": true,
+    "memory_locking_available": true
+  },
+  "baseline_comparison": {
+    "raw_inference_ms": 1.437,
+    "secure_inference_ms": 28.924,
+    "security_overhead_ms": 27.488,
+    "overhead_percent": 1913.47,
+    "raw_fps": 696.1,
+    "secure_fps": 34.6,
+    "both_meet_30fps": true
+  }
+}
