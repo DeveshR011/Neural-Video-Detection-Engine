@@ -49,7 +49,7 @@ graph TD
     K -->|OOD Det.| L[Temporal Smoothing<br/>EMA + Box Momentum]:::ml
 
     L --> M[Secure Output Buffer]:::secure
-    L -.->|Trigger| N(Memory Wipe<br/>`.zero_()`):::secure
+    L -.->|Trigger| N("Memory Wipe<br/>.zero_()"):::secure
     L -.->|Log| O(Hash-Chain Audit Log<br/>HMAC-SHA256):::secure
 ```
 
