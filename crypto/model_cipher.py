@@ -33,6 +33,18 @@ class ModelCipher:
         with open(model_path, 'rb') as f:
             data = f.read()
 
+        self._encrypt_bytes(data, output_path, hash_path)
+
+    def encrypt_state_dict(self, state_dict: dict, output_path: str, hash_path: str):
+        """Encrypt a state_dict directly from memory without writing plaintext to disk."""
+        buffer = io.BytesIO()
+        torch.save(state_dict, buffer)
+        data = buffer.getvalue()
+        self._encrypt_bytes(data, output_path, hash_path)
+
+    def _encrypt_bytes(self, data: bytes, output_path: str, hash_path: str):
+        """Common byte-oriented encryption path for model artifacts."""
+
         # Integrity hash (pre-encryption)
         model_hash = hashlib.sha256(data).digest()
         with open(hash_path, 'wb') as f:

@@ -1,11 +1,9 @@
 """
 Dynamic Architecture Morphing
 ===============================
-On each boot, generates a per-session random channel permutation and
-affine remapping for convolutional layers. Applies P · W · P^T
-transforms to weights so model behavior is identical but internal
-representation is randomized, preventing cross-session feature
-reverse engineering.
+Experimental per-session channel permutation/affine remapping utility.
+For complex detector topologies (CSP, residual, concat, BiFPN), strict
+output-preserving guarantees are not provided.
 
 Compatible with depthwise-separable convolutions and BiFPN architectures.
 """
@@ -31,10 +29,11 @@ class ArchitectureMorpher:
     - Layers where channel dimensions don't align with the next layer
     """
 
-    def __init__(self, session_seed: bytes = None):
+    def __init__(self, session_seed: bytes = None, enabled: bool = False):
         if session_seed is None:
             session_seed = os.urandom(32)
         self.session_seed = session_seed
+        self.enabled = enabled
         self._seed_int = int.from_bytes(
             hashlib.sha256(session_seed).digest()[:4], "big"
         )
@@ -43,6 +42,13 @@ class ArchitectureMorpher:
 
     def morph(self, model: nn.Module) -> nn.Module:
         """Apply per-session morphing to eligible Conv2d+BN pairs."""
+        if not self.enabled:
+            logger.warning(
+                "Architecture morphing is disabled by default. "
+                "Enable explicitly only for controlled experiments."
+            )
+            return model
+
         if self._morphed:
             logger.warning("Model already morphed this session.")
             return model
@@ -89,7 +95,7 @@ class ArchitectureMorpher:
         logger.info(
             f"Architecture morphed: {morphed_count} layer pairs with seed "
             f"{self.session_seed[:8].hex()}... "
-            f"Model outputs remain mathematically equivalent."
+            f"No strict output-invariance guarantee is claimed."
         )
         return model
 

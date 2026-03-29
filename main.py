@@ -99,15 +99,13 @@ def main():
         param_count = sum(p.numel() for p in temp_model.parameters())
         logger.info(f"  Architecture: CSP+BiFPN | Params: {param_count:,}")
 
-        # Encrypt → Decrypt roundtrip
-        torch.save(temp_model.state_dict(), "secure_enclave/raw_model.pt")
+        # Encrypt → Decrypt roundtrip (in-memory plaintext only)
         mc = ModelCipher(model_key, device_fingerprint=device_fp)
-        mc.encrypt_model(
-            "secure_enclave/raw_model.pt",
+        mc.encrypt_state_dict(
+            temp_model.state_dict(),
             "secure_enclave/detector.enc",
             "secure_enclave/detector.hash",
         )
-        os.remove("secure_enclave/raw_model.pt")
 
         state_dict = mc.load_secure_model(
             "secure_enclave/detector.enc",
@@ -141,9 +139,13 @@ def main():
             "accuracy": round(wm_accuracy, 4),
         })
 
-        # ══ Phase 6: Architecture Morphing ════════════════════════════
-        logger.info("[Phase 6] Applying per-session architecture morphing...")
-        morpher = ArchitectureMorpher()
+        # ══ Phase 6: Architecture Morphing (Experimental) ════════════
+        morph_enabled = os.getenv("NVDE_ENABLE_EXPERIMENTAL_MORPH", "0") == "1"
+        if morph_enabled:
+            logger.info("[Phase 6] Applying experimental architecture morphing...")
+        else:
+            logger.info("[Phase 6] Architecture morphing disabled (experimental feature)")
+        morpher = ArchitectureMorpher(enabled=morph_enabled)
         model = morpher.morph(model)
 
         # ══ Phase 7: Runtime Integrity ════════════════════════════════
@@ -185,7 +187,14 @@ def main():
         # ══ Phase 9: Extended ML Benchmarks ═══════════════════════════
         logger.info("[Phase 9] Running extended ML benchmark suite...")
         bench = BenchmarkSuite(model, device)
-        bench.run_all(num_frames=50, output_path="secure_enclave/ml_benchmark_results.json")
+        eval_root = "coco" if os.path.exists("coco/annotations") else None
+        bench.run_all(
+            num_frames=50,
+            output_path="secure_enclave/ml_benchmark_results.json",
+            eval_data_root=eval_root,
+            eval_split="val",
+            eval_max_images=100,
+        )
         bench.print_summary()
 
         # ══ Phase 10: Secure Shutdown ═════════════════════════════════

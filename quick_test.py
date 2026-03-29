@@ -1,31 +1,44 @@
-"""Quick verification test."""
-import torch, logging, os
-logging.basicConfig(level=logging.INFO, format='%(name)-18s | %(message)s')
+"""Quick smoke test for core model/security plumbing.
+
+This script is intentionally lightweight and should complete quickly.
+"""
+
+import logging
+import os
+import torch
 
 from model.detector import SecureYOLO
 from model.watermark import WatermarkEmbedder, WatermarkVerifier
-from security.architecture_morph import ArchitectureMorpher
 from security.runtime_integrity import LayerHashRegistry
-from benchmarks.benchmark import BenchmarkSuite
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+logging.basicConfig(level=logging.INFO, format="%(name)-18s | %(message)s")
 
-model = SecureYOLO(80, fpn_channels=128).to(device)
-params = sum(p.numel() for p in model.parameters())
-print(f'\n=== MODEL: {params:,} params ===')
 
-wk = os.urandom(32)
-model = WatermarkEmbedder(wk).embed(model, strength=0.001)
-v, acc = WatermarkVerifier(wk).verify(model)
-print(f'Watermark: valid={v}, accuracy={acc:.2%}')
+def main():
+	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+	model = SecureYOLO(80, fpn_channels=128).to(device).eval()
 
-model = ArchitectureMorpher().morph(model)
+	params = sum(p.numel() for p in model.parameters())
+	print(f"model_params={params}")
 
-reg = LayerHashRegistry()
-reg.register_model(model)
-print(f'Integrity: {len(reg.get_registered_names())} layers')
+	x = torch.rand(1, 3, 640, 640, device=device)
+	with torch.no_grad():
+		raw = model(x)
+		pred = model.predict(x)
+	print(f"raw_shape={tuple(raw.shape)}")
+	print(f"pred_shape={tuple(pred.shape)}")
 
-bench = BenchmarkSuite(model, device)
-results = bench.run_all(num_frames=30, output_path='secure_enclave/ml_benchmark_results.json')
-bench.print_summary()
-print('\nVERIFICATION COMPLETE')
+	wk = os.urandom(32)
+	model = WatermarkEmbedder(wk).embed(model, strength=0.001)
+	valid, acc = WatermarkVerifier(wk).verify(model)
+	print(f"watermark_valid={valid} watermark_acc={acc:.4f}")
+
+	reg = LayerHashRegistry()
+	reg.register_model(model)
+	print(f"integrity_layers={len(reg.get_registered_names())}")
+
+	print("quick_test_status=ok")
+
+
+if __name__ == "__main__":
+	main()

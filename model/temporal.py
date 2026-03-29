@@ -100,19 +100,18 @@ class BoxMomentumTracker:
 
         smoothed = boxes.clone()
 
-        # Match current boxes to previous via IoU
+        # Vectorized matching to keep runtime bounded.
         if boxes.numel() > 0 and self._prev_boxes.numel() > 0:
             ious = self._compute_iou_matrix(boxes, self._prev_boxes)
-
-            for i in range(len(boxes)):
-                if ious.shape[1] > 0:
-                    best_iou, best_idx = ious[i].max(0)
-                    if best_iou > self.iou_threshold:
-                        # Apply momentum smoothing
-                        smoothed[i] = (
-                            (1 - self.momentum) * boxes[i] +
-                            self.momentum * self._prev_boxes[best_idx]
-                        )
+            if ious.numel() > 0:
+                best_iou, best_idx = ious.max(dim=1)
+                match_mask = best_iou > self.iou_threshold
+                if match_mask.any():
+                    matched_prev = self._prev_boxes[best_idx[match_mask]]
+                    smoothed[match_mask] = (
+                        (1 - self.momentum) * boxes[match_mask] +
+                        self.momentum * matched_prev
+                    )
 
         self._prev_boxes = smoothed.clone().detach()
         self._prev_confs = confidences.clone().detach()
@@ -121,34 +120,30 @@ class BoxMomentumTracker:
 
     def _compute_iou_matrix(self, boxes_a: torch.Tensor, boxes_b: torch.Tensor) -> torch.Tensor:
         """Compute pairwise IoU matrix between two sets of xywh boxes."""
-        # Convert xywh → xyxy
-        a_x1 = boxes_a[:, 0] - boxes_a[:, 2] / 2
-        a_y1 = boxes_a[:, 1] - boxes_a[:, 3] / 2
-        a_x2 = boxes_a[:, 0] + boxes_a[:, 2] / 2
-        a_y2 = boxes_a[:, 1] + boxes_a[:, 3] / 2
+        if boxes_a.numel() == 0 or boxes_b.numel() == 0:
+            return torch.zeros((boxes_a.shape[0], boxes_b.shape[0]), device=boxes_a.device)
 
-        b_x1 = boxes_b[:, 0] - boxes_b[:, 2] / 2
-        b_y1 = boxes_b[:, 1] - boxes_b[:, 3] / 2
-        b_x2 = boxes_b[:, 0] + boxes_b[:, 2] / 2
-        b_y2 = boxes_b[:, 1] + boxes_b[:, 3] / 2
+        a_xyxy = torch.empty_like(boxes_a)
+        b_xyxy = torch.empty_like(boxes_b)
+        a_xyxy[:, 0] = boxes_a[:, 0] - boxes_a[:, 2] / 2
+        a_xyxy[:, 1] = boxes_a[:, 1] - boxes_a[:, 3] / 2
+        a_xyxy[:, 2] = boxes_a[:, 0] + boxes_a[:, 2] / 2
+        a_xyxy[:, 3] = boxes_a[:, 1] + boxes_a[:, 3] / 2
+        b_xyxy[:, 0] = boxes_b[:, 0] - boxes_b[:, 2] / 2
+        b_xyxy[:, 1] = boxes_b[:, 1] - boxes_b[:, 3] / 2
+        b_xyxy[:, 2] = boxes_b[:, 0] + boxes_b[:, 2] / 2
+        b_xyxy[:, 3] = boxes_b[:, 1] + boxes_b[:, 3] / 2
 
-        n_a, n_b = len(boxes_a), len(boxes_b)
-        ious = torch.zeros(n_a, n_b, device=boxes_a.device)
+        inter_x1 = torch.maximum(a_xyxy[:, None, 0], b_xyxy[None, :, 0])
+        inter_y1 = torch.maximum(a_xyxy[:, None, 1], b_xyxy[None, :, 1])
+        inter_x2 = torch.minimum(a_xyxy[:, None, 2], b_xyxy[None, :, 2])
+        inter_y2 = torch.minimum(a_xyxy[:, None, 3], b_xyxy[None, :, 3])
+        inter = (inter_x2 - inter_x1).clamp(0) * (inter_y2 - inter_y1).clamp(0)
 
-        for i in range(n_a):
-            inter_x1 = torch.max(a_x1[i], b_x1)
-            inter_y1 = torch.max(a_y1[i], b_y1)
-            inter_x2 = torch.min(a_x2[i], b_x2)
-            inter_y2 = torch.min(a_y2[i], b_y2)
-
-            inter = (inter_x2 - inter_x1).clamp(0) * (inter_y2 - inter_y1).clamp(0)
-            area_a = (a_x2[i] - a_x1[i]) * (a_y2[i] - a_y1[i])
-            area_b = (b_x2 - b_x1) * (b_y2 - b_y1)
-            union = area_a + area_b - inter + 1e-7
-
-            ious[i] = inter / union
-
-        return ious
+        area_a = (a_xyxy[:, 2] - a_xyxy[:, 0]).clamp(0) * (a_xyxy[:, 3] - a_xyxy[:, 1]).clamp(0)
+        area_b = (b_xyxy[:, 2] - b_xyxy[:, 0]).clamp(0) * (b_xyxy[:, 3] - b_xyxy[:, 1]).clamp(0)
+        union = area_a[:, None] + area_b[None, :] - inter + 1e-7
+        return inter / union
 
     def reset(self):
         """Clear tracking state (secure shutdown)."""
@@ -167,10 +162,12 @@ class TemporalSmoother:
     """
 
     def __init__(self, ema_alpha: float = 0.3, box_momentum: float = 0.7,
-                 iou_threshold: float = 0.3, num_classes: int = 80):
+                 iou_threshold: float = 0.3, num_classes: int = 80,
+                 max_tracked_boxes: int = 64):
         self.ema_smoother = EMALogitSmoother(alpha=ema_alpha)
         self.box_tracker = BoxMomentumTracker(momentum=box_momentum, iou_threshold=iou_threshold)
         self.num_classes = num_classes
+        self.max_tracked_boxes = max_tracked_boxes
 
     def smooth(self, detections: torch.Tensor) -> torch.Tensor:
         """
@@ -189,9 +186,13 @@ class TemporalSmoother:
             confs = torch.sigmoid(smoothed[b, :, 4])
             mask = confs > 0.3
             if mask.sum() > 0:
-                boxes = smoothed[b, mask, :4]
-                tracked = self.box_tracker.smooth(boxes, confs[mask])
-                smoothed[b, mask, :4] = tracked
+                idx = torch.where(mask)[0]
+                if idx.numel() > self.max_tracked_boxes:
+                    topk_local = torch.topk(confs[idx], self.max_tracked_boxes).indices
+                    idx = idx[topk_local]
+                boxes = smoothed[b, idx, :4]
+                tracked = self.box_tracker.smooth(boxes, confs[idx])
+                smoothed[b, idx, :4] = tracked
 
         return smoothed
 

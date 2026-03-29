@@ -233,11 +233,72 @@ class DetectionLoss(nn.Module):
         self.lambda_obj = lambda_obj
         self.lambda_jitter = lambda_jitter
         self.iou_assign_thresh = iou_assign_thresh
+        self.anchors = (
+            ((10.0, 13.0), (16.0, 30.0), (33.0, 23.0)),
+            ((30.0, 61.0), (62.0, 45.0), (59.0, 119.0)),
+            ((116.0, 90.0), (156.0, 198.0), (373.0, 326.0)),
+        )
+        self.strides = (8.0, 16.0, 32.0)
 
         self.box_loss = CIoULoss()
         self.cls_loss = FocalLoss(alpha=0.25, gamma=2.0)
         self.obj_loss = nn.BCEWithLogitsLoss()
         self.jitter_loss = TemporalJitterLoss(weight=lambda_jitter)
+
+    def _decode_flat_boxes(self, pred_boxes_raw: torch.Tensor) -> torch.Tensor:
+        """Decode raw [N,4] YOLO box predictions into normalized xywh for matching/regression."""
+        n_pred = pred_boxes_raw.shape[0]
+        device = pred_boxes_raw.device
+        dtype = pred_boxes_raw.dtype
+
+        if n_pred % 3 != 0:
+            xy = torch.sigmoid(pred_boxes_raw[:, :2])
+            wh = torch.sigmoid(pred_boxes_raw[:, 2:4])
+            return torch.cat([xy, wh], dim=-1)
+
+        cells_total = n_pred // 3
+        base = int(round((cells_total * 16.0 / 21.0) ** 0.5))
+        h1 = max(base, 4)
+        h2 = max(h1 // 2, 2)
+        h3 = max(h1 // 4, 1)
+        w1, w2, w3 = h1, h2, h3
+
+        counts = [3 * h1 * w1, 3 * h2 * w2, 3 * h3 * w3]
+        if sum(counts) != n_pred:
+            xy = torch.sigmoid(pred_boxes_raw[:, :2])
+            wh = torch.sigmoid(pred_boxes_raw[:, 2:4])
+            return torch.cat([xy, wh], dim=-1)
+
+        decoded_scales = []
+        start = 0
+        for scale_idx, (h, w, stride, anchors) in enumerate(zip((h1, h2, h3), (w1, w2, w3), self.strides, self.anchors)):
+            end = start + counts[scale_idx]
+            raw = pred_boxes_raw[start:end].reshape(3, h, w, 4)
+
+            yv, xv = torch.meshgrid(
+                torch.arange(h, device=device),
+                torch.arange(w, device=device),
+                indexing='ij'
+            )
+            grid = torch.stack((xv, yv), dim=-1).to(dtype).view(1, h, w, 2)
+            anchor_t = torch.tensor(anchors, device=device, dtype=dtype).view(3, 1, 1, 2)
+
+            xy = (torch.sigmoid(raw[..., :2]) + grid) * stride
+            wh = torch.exp(raw[..., 2:4]).clamp(max=1e3) * anchor_t
+
+            # Assume square training images with side length stride * feature_size_of_smallest_scale.
+            image_size = float(h1 * self.strides[0])
+            decoded = torch.cat([
+                xy[..., 0:1] / image_size,
+                xy[..., 1:2] / image_size,
+                wh[..., 0:1] / image_size,
+                wh[..., 1:2] / image_size,
+            ], dim=-1).clamp(0.0, 1.0)
+
+            decoded_scales.append(decoded.reshape(-1, 4))
+            start = end
+
+        return torch.cat(decoded_scales, dim=0)
 
     def _assign_targets(self, pred_boxes, gt_boxes, gt_mask):
         """
@@ -272,13 +333,19 @@ class DetectionLoss(nn.Module):
         # Best GT for each prediction
         best_iou, best_idx = ious.max(dim=1)  # [N], [N]
 
-        # Only assign if IoU exceeds threshold
+        # Positive by threshold + force at least one prediction per GT.
         positive_mask = best_iou > self.iou_assign_thresh
+        best_pred_for_each_gt = ious.argmax(dim=0)
+        positive_mask[best_pred_for_each_gt] = True
 
         # Map back to original GT indices
         valid_indices = torch.where(valid)[0]  # [K]
         assigned_gt_idx = torch.full((n_pred,), -1, device=pred_boxes.device, dtype=torch.long)
         assigned_gt_idx[positive_mask] = valid_indices[best_idx[positive_mask]]
+
+        # Ensure forced positives are explicitly mapped to their GT.
+        for k, pred_idx in enumerate(best_pred_for_each_gt):
+            assigned_gt_idx[pred_idx] = valid_indices[k]
 
         return assigned_gt_idx, positive_mask
 
@@ -298,7 +365,8 @@ class DetectionLoss(nn.Module):
 
         for b in range(B):
             pred_b = predictions[b]  # [N, 5+C]
-            pred_boxes = pred_b[:, :4]
+            pred_boxes_raw = pred_b[:, :4]
+            pred_boxes = self._decode_flat_boxes(pred_boxes_raw)
             pred_obj = pred_b[:, 4]
             pred_cls = pred_b[:, 5:]
 

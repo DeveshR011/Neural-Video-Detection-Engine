@@ -1,10 +1,34 @@
 # 🛡️ Neural Video Detection Engine
 
-### Fully Local, Encrypted, Zero-Trust Object Detection
+### Local, Security-Oriented Object Detection (Research Prototype)
 
-A research-grade AI system that performs **real-time object detection entirely on-device** while enforcing zero-trust security across storage, memory, model integrity, and runtime execution — with **no cloud dependency**.
+A security-oriented detector prototype that runs fully on-device and combines object detection with encryption, integrity checks, and runtime hardening experiments.
 
-> **Key Result**: 131.8 FPS raw | 34.6 FPS with full security stack active on CUDA @ 640×640
+> Status: core detector/training/inference path is implemented, but several subsystems are still experimental or stubbed. See feature status below.
+
+---
+
+## Feature Status (Honest Partition)
+
+### Implemented
+
+- Multi-scale detector architecture (CSP + BiFPN heads) with YOLO-style decode + NMS in inference
+- End-to-end training loop with detection losses, checkpoint save/resume, and optional adversarial batches
+- Secure model encryption/decryption path (AES-GCM, device-bound AAD)
+- Runtime integrity hash registry and secure logging pipeline
+- Dataset integrity checks for COCO file presence and missing image detection
+
+### Experimental (Not Security-Critical Guarantees)
+
+- Architecture morphing: disabled by default; no strict output-invariance guarantee
+- Temporal smoothing and adversarial preprocessing as robustness experiments
+- Benchmark stress tests on synthetic inputs for performance only (not quality claims)
+- Structured pruning rewrite path is feature-gated off by default for safety
+
+### Stubbed / Placeholder
+
+- SGX/SEV enclave backends are interface-level placeholders, not production enclave implementations
+- Security benchmark sections that require certified hardware trust chains
 
 ---
 
@@ -207,20 +231,20 @@ This ensures that even if an attacker intercepts the feature map, the learned re
 | Phase | Component | Function |
 |-------|-----------|----------|
 | 1 | Device Key Derivation | TPM-sealed or HKDF from hardware fingerprint |
-| 2 | Secure Enclave | Memory-locked, core-dump-protected execution |
+| 2 | Secure Enclave | Process-level secure memory wrapper (not production SGX/SEV) |
 | 3 | Hash-Chain Logging | HMAC-SHA256 tamper-evident audit trail |
 | 4 | Encrypted Model Load | AES-256-GCM with device-bound AAD |
 | 5 | Neural Watermarking | Cryptographic signature in weight space |
-| 6 | Architecture Morphing | Per-boot channel permutation (P·W·Pᵀ) |
+| 6 | Architecture Morphing (Experimental) | Disabled by default; no invariance guarantee |
 | 7 | Runtime Integrity | Probabilistic SHA-256 layer hashing |
 | 8 | Secure Pipeline | All defenses active, AMP inference |
-| 9 | Benchmarking | 7-dimension evaluation suite |
+| 9 | Benchmarking | Performance + optional real-data quality eval |
 | 10 | Secure Shutdown | 3-pass memory wipe, secret destruction |
 
 ### Key Security Properties
 
 - **Device-Bound Encryption**: Model and video keys are derived from hardware fingerprint — stolen files cannot be decrypted on another device
-- **Architecture Morphing**: Each boot randomizes internal channel ordering via P·W·Pᵀ transforms — reverse engineering the model from one session doesn't transfer to the next
+- **Architecture Morphing (Experimental)**: Available only behind explicit opt-in and should not be treated as output-preserving for this topology
 - **Memory Protection**: All intermediate tensors are `.zero_()`'d immediately after use; VirtualLock prevents paging to disk
 - **Constant-Time Crypto**: All security comparisons use `hmac.compare_digest` to prevent timing attacks
 
@@ -266,7 +290,7 @@ Two-stage inference-time stabilization:
 
 ### Compression (Optional)
 
-- **Structured Pruning**: L1-norm channel importance → prune lowest channels
+- **Structured Pruning (Feature-Gated)**: Disabled by default because unsafe channel rewrites can break multi-branch topology
 - **Knowledge Distillation**: KL-div + feature MSE from larger teacher
 - **QAT**: INT8-ready via fake-quantize observers
 
@@ -400,15 +424,37 @@ pip install -r requirements.txt
 python main.py
 ```
 
-This executes the full 10-phase lifecycle with synthetic video and produces benchmark results in `secure_enclave/ml_benchmark_results.json`.
+This executes the full lifecycle and writes benchmark output to `secure_enclave/ml_benchmark_results.json`.
 
-### Train on COCO
+### Quick Smoke Test
 
 ```bash
-python train.py --data coco --epochs 300 --batch-size 16 --device cuda
+python quick_test.py
 ```
 
-### Run Benchmarks Only
+This verifies core model forward/predict, watermarking, and integrity registration without running a long benchmark.
+
+### Train on COCO (Reproducible)
+
+Recommended (if your local dataset currently has only `val2017` images):
+
+```bash
+python train.py --data coco --train-split val --epochs 50 --batch-size 16 --device cuda --workers 4 --seed 42 --adversarial-finetune-ratio 0.2
+```
+
+Full training (when `train2017` images and `instances_train2017.json` are both complete):
+
+```bash
+python train.py --data coco --train-split train --epochs 300 --batch-size 16 --device cuda --workers 4 --seed 42 --adversarial-finetune-ratio 0.2
+```
+
+Resume a run:
+
+```bash
+python train.py --data coco --train-split val --device cuda --resume checkpoints/epoch_20.pt --epochs 100 --seed 42
+```
+
+### Run Benchmarks Only (Performance + Optional Real Quality)
 
 ```bash
 python -c "
@@ -418,10 +464,12 @@ import torch
 
 model = SecureYOLO(80).to('cuda')
 bench = BenchmarkSuite(model, torch.device('cuda'))
-bench.run_all(num_frames=100)
+bench.run_all(num_frames=100, eval_data_root='coco', eval_split='val', eval_max_images=100)
 bench.print_summary()
 "
 ```
+
+If `eval_data_root` is not provided, quality metrics (mAP/precision/recall/ECE) are intentionally marked as skipped.
 
 ---
 
@@ -470,16 +518,15 @@ Neural Video Detection Engine/
 
 ## Benchmark Results
 
-| Target Variable | Value / Result |
-|--------|-------|
-| Inference (raw) | 7.59ms → **131.8 FPS** |
-| Inference (secure) | ~28.9ms → **34.6 FPS** |
-| Parameters | 2,735,607 (10.9 MB) |
-| Peak Activations | ~25 MB |
-| Integrity Layers | 158 |
-| Adversarial Box IoU (ε=2/255) | 0.508 |
-| 30 FPS Target | ✅ PASS |
-| Synthetic Training (5 epochs) | Loss: 1.28 → 0.70 (best validation) |
+Benchmark numbers depend heavily on hardware, runtime load, and whether quality evaluation uses real labeled data.
+Use the generated JSON artifact for current results:
+
+- `secure_enclave/ml_benchmark_results.json`
+
+Interpretation guidance:
+
+- `latency` and `baseline_comparison` are performance-oriented.
+- `detection_quality`, `calibration`, and `adversarial_eval` are only meaningful when `eval_data_root` points to labeled data.
 
 ---
 

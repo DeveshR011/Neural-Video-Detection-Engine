@@ -1,21 +1,22 @@
 """
 COCO 2017 Dataset Downloader
 =============================
-Downloads and extracts the COCO 2017 validation images (1GB) 
-and train/val annotations (241MB) as a lightweight starting point 
-for training with real data.
+Downloads and extracts COCO 2017 data for reliable detection training.
+By default this script downloads both train2017 and val2017 images,
+plus train/val annotations.
 """
 
 import os
 import sys
 import zipfile
 import urllib.request
+import argparse
 from pathlib import Path
 
 # URLs for COCO 2017
 URLS = {
-    # 'train2017': 'http://images.cocodataset.org/zips/train2017.zip',  # 18GB (Heavy!)
-    'val2017': 'http://images.cocodataset.org/zips/val2017.zip',        # 1GB (Recommended for test)
+    'train2017': 'http://images.cocodataset.org/zips/train2017.zip',
+    'val2017': 'http://images.cocodataset.org/zips/val2017.zip',
     'annotations': 'http://images.cocodataset.org/annotations/annotations_trainval2017.zip' # 241MB
 }
 
@@ -43,41 +44,30 @@ def extract_zip(zip_path: str, extract_to: str):
         zip_ref.extractall(extract_to)
     print("[+] Extraction complete.")
 
-def setup_coco(target_dir="coco"):
+def setup_coco(target_dir="coco", val_only=False):
     """Setup directory structure and download COCO data."""
     os.makedirs(target_dir, exist_ok=True)
     os.makedirs(f"{target_dir}/images", exist_ok=True)
     os.makedirs(f"{target_dir}/zips", exist_ok=True)
     
     print("="*50)
-    print("  COCO 2017 Lightweight Dataset Setup")
+    print("  COCO 2017 Dataset Setup")
     print("="*50)
-    
-    # Download Validation images
+
+    if not val_only:
+        train_zip = f"{target_dir}/zips/train2017.zip"
+        download_file(URLS['train2017'], train_zip)
+        if not os.path.exists(f"{target_dir}/images/train2017"):
+            extract_zip(train_zip, f"{target_dir}/images")
+
+    # Download validation images
     val_zip = f"{target_dir}/zips/val2017.zip"
     download_file(URLS['val2017'], val_zip)
     if not os.path.exists(f"{target_dir}/images/val2017"):
         extract_zip(val_zip, f"{target_dir}/images")
-        
-    # Since we are using val2017 as a quick start, we will symlink/copy it to train2017 
-    # so the train.py script doesn't fail looking for training data.
-    # We just want to get real data flowing through the pipeline quickly.
-    print("[*] Setting up validation set as training set for a quick start test...")
-    if not os.path.exists(f"{target_dir}/images/train2017"):
-        # Just rename/symlink logic depending on OS, for simplicity we create a junction or copy
-        if sys.platform == "win32":
-            import _winapi
-            try:
-                _winapi.CreateJunction(
-                    os.path.abspath(f"{target_dir}/images/val2017"), 
-                    os.path.abspath(f"{target_dir}/images/train2017")
-                )
-                print("    [+] Created junction: train2017 -> val2017")
-            except Exception as e:
-                print(f"    [-] Junction failed: {e}. You may need to copy the folder manually.")
-        else:
-            os.symlink("val2017", f"{target_dir}/images/train2017")
-            print("    [+] Created symlink: train2017 -> val2017")
+    elif not os.path.exists(f"{target_dir}/images/train2017"):
+        print("[!] val-only mode enabled: train2017 was not downloaded.")
+        print("[!] Training with --train-split train will fail integrity checks unless you pass --allow-synthetic.")
 
     # Download Annotations
     ann_zip = f"{target_dir}/zips/annotations.zip"
@@ -88,8 +78,16 @@ def setup_coco(target_dir="coco"):
     print("="*50)
     print("  Dataset Setup Complete!")
     print(f"  Target directory: {os.path.abspath(target_dir)}")
-    print("  You can now run: python train.py --data coco --epochs 2")
+    if val_only:
+        print("  For evaluation-only flows, use: python train.py --data coco --train-split val --epochs 2")
+    else:
+        print("  You can now run: python train.py --data coco --epochs 2")
     print("="*50)
 
 if __name__ == "__main__":
-    setup_coco()
+    parser = argparse.ArgumentParser(description="Download COCO 2017 data")
+    parser.add_argument('--target-dir', type=str, default='coco', help='Output dataset directory')
+    parser.add_argument('--val-only', action='store_true', help='Download only val2017 images (not train2017)')
+    args = parser.parse_args()
+
+    setup_coco(target_dir=args.target_dir, val_only=args.val_only)

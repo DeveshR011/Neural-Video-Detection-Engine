@@ -91,7 +91,10 @@ class SecurePipelineRunner:
                     t_frame = t_frame.unsqueeze(0)
 
                 # ── 2. Adversarial preprocessing ─────────────────────
-                t_frame = AdversarialRobustness.preprocess_frame(t_frame)
+                t_frame = AdversarialRobustness.preprocess_frame(
+                    t_frame,
+                    allow_cpu_transforms=False,
+                )
 
                 # ── 3. CUDA dummy noise (pre-inference) ──────────────
                 if self.cuda_randomizer:
@@ -104,9 +107,9 @@ class SecurePipelineRunner:
                     with torch.no_grad():
                         if self.use_amp:
                             with torch.amp.autocast('cuda'):
-                                return self.model.secure_forward(t_frame)
+                                return self.model.predict(t_frame)
                         else:
-                            return self.model.secure_forward(t_frame)
+                            return self.model.predict(t_frame)
 
                 if self.timing_injector:
                     raw_predictions = self.timing_injector.wrap_inference(_infer)
@@ -121,10 +124,8 @@ class SecurePipelineRunner:
                     self.cuda_randomizer.post_inference_noise()
                     self.cuda_randomizer.synchronize()
 
-                # ── 6. Filter predictions ────────────────────────────
-                filtered = AdversarialRobustness.apply_confidence_threshold(
-                    raw_predictions, threshold=0.5
-                )
+                # ── 6. Decoded/NMS detections are already confidence-filtered ──
+                filtered = raw_predictions
 
                 # ── 7. Temporal smoothing (ML) ───────────────────────
                 if self.temporal_smoother:

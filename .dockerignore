@@ -1,0 +1,31 @@
+# Git and editor metadata
+.git
+.gitignore
+.vscode/
+.idea/
+
+# Python cache and virtual env
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+
+# Local artifacts and large datasets
+checkpoints/
+coco/
+secure_enclave/*.enc
+secure_enclave/*.hash
+secure_enclave/*.json
+secure_enclave/*.log
+
+# Build and tooling files
+build/
+dist/
+benchmarks/__pycache__/
+model/__pycache__/
+pipeline/__pycache__/
+security/__pycache__/
+crypto/__pycache__/

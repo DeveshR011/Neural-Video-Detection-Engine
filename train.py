@@ -43,6 +43,15 @@ logging.basicConfig(
 logger = logging.getLogger("Training")
 
 
+def set_seed(seed: int):
+    """Set random seeds for reproducible experiments."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  Dataset
 # ══════════════════════════════════════════════════════════════════════
@@ -66,17 +75,27 @@ class COCODetectionDataset(Dataset):
 
     def __init__(self, data_root: str = None, split: str = "train",
                  img_size: int = 640, num_classes: int = 80,
-                 max_objects: int = 50, synthetic_size: int = 1000):
+                 max_objects: int = 50, synthetic_size: int = 1000,
+                 allow_synthetic_fallback: bool = False):
         self.img_size = img_size
         self.num_classes = num_classes
         self.max_objects = max_objects
-        self.use_synthetic = data_root is None or not os.path.exists(data_root)
+        self.allow_synthetic_fallback = allow_synthetic_fallback
+        self.use_synthetic = data_root is None
 
         if self.use_synthetic:
             logger.info(f"No dataset at '{data_root}' — using synthetic data ({synthetic_size} samples)")
             self.length = synthetic_size
             self.annotations = None
         else:
+            if not os.path.exists(data_root):
+                if self.allow_synthetic_fallback:
+                    logger.warning(f"Dataset root '{data_root}' does not exist. Falling back to synthetic data.")
+                    self.use_synthetic = True
+                    self.length = synthetic_size
+                    self.annotations = None
+                    return
+                raise FileNotFoundError(f"Dataset root does not exist: {data_root}")
             self._load_coco(data_root, split)
 
     def _load_coco(self, data_root: str, split: str):
@@ -85,10 +104,19 @@ class COCODetectionDataset(Dataset):
         img_dir = os.path.join(data_root, "images", f"{split}2017")
 
         if not os.path.exists(ann_file):
-            logger.warning(f"Annotation file not found: {ann_file}. Using synthetic data.")
-            self.use_synthetic = True
-            self.length = 1000
-            return
+            if self.allow_synthetic_fallback:
+                logger.warning(f"Annotation file not found: {ann_file}. Falling back to synthetic data.")
+                self.use_synthetic = True
+                self.length = 1000
+                return
+            raise FileNotFoundError(f"Missing annotation file: {ann_file}")
+        if not os.path.exists(img_dir):
+            if self.allow_synthetic_fallback:
+                logger.warning(f"Image directory not found: {img_dir}. Falling back to synthetic data.")
+                self.use_synthetic = True
+                self.length = 1000
+                return
+            raise FileNotFoundError(f"Missing image directory: {img_dir}")
 
         try:
             with open(ann_file, 'r') as f:
@@ -112,11 +140,28 @@ class COCODetectionDataset(Dataset):
             self.cat_to_idx = {cat['id']: idx for idx, cat in
                               enumerate(coco_data['categories'])}
 
+            missing = 0
+            for img_id in self.img_ids:
+                file_name = self.images[img_id]['file_name']
+                if not os.path.exists(os.path.join(self.img_dir, file_name)):
+                    missing += 1
+            if missing > 0:
+                message = f"COCO split '{split}' has {missing} missing image files under {self.img_dir}."
+                if self.allow_synthetic_fallback:
+                    logger.warning(message + " Falling back to synthetic data.")
+                    self.use_synthetic = True
+                    self.length = 1000
+                    return
+                raise FileNotFoundError(message)
+
             logger.info(f"Loaded {self.length} images from {split} split")
         except Exception as e:
-            logger.warning(f"Failed to load COCO: {e}. Using synthetic data.")
-            self.use_synthetic = True
-            self.length = 1000
+            if self.allow_synthetic_fallback:
+                logger.warning(f"Failed to load COCO: {e}. Falling back to synthetic data.")
+                self.use_synthetic = True
+                self.length = 1000
+            else:
+                raise
 
     def __len__(self):
         return self.length
@@ -171,7 +216,7 @@ class COCODetectionDataset(Dataset):
         # Load and resize image
         img = cv2.imread(img_path)
         if img is None:
-            return self._generate_synthetic()
+            raise FileNotFoundError(f"Failed to load COCO image: {img_path}")
 
         h_orig, w_orig = img.shape[:2]
         img = cv2.resize(img, (self.img_size, self.img_size))
@@ -226,12 +271,18 @@ def collate_fn(batch):
 
 def train(args):
     """Main training function."""
+    set_seed(args.seed)
     device = torch.device(args.device)
     logger.info(f"Device: {device}")
+    logger.info(f"Seed: {args.seed}")
     
     if device.type == 'cuda':
         # Auto-tune convolution algorithms for maximum hardware efficiency
         torch.backends.cudnn.benchmark = True
+        if args.allow_tf32:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision('high')
         logger.info("Enabled CuDNN Benchmark for maximum throughput")
 
     # ── Model ─────────────────────────────────────────────────────
@@ -239,6 +290,8 @@ def train(args):
         num_classes=args.num_classes,
         fpn_channels=args.fpn_channels,
     ).to(device)
+    if device.type == 'cuda' and args.channels_last:
+        model = model.to(memory_format=torch.channels_last)
 
     param_count = sum(p.numel() for p in model.parameters())
     logger.info(f"Model: SecureYOLO v3 | Params: {param_count:,}")
@@ -250,6 +303,7 @@ def train(args):
         img_size=args.img_size,
         num_classes=args.num_classes,
         synthetic_size=args.synthetic_size,
+        allow_synthetic_fallback=args.allow_synthetic,
     )
     val_dataset = COCODetectionDataset(
         data_root=args.data,
@@ -257,24 +311,30 @@ def train(args):
         img_size=args.img_size,
         num_classes=args.num_classes,
         synthetic_size=args.synthetic_size // 5,
+        allow_synthetic_fallback=args.allow_synthetic,
     )
+
+    loader_kwargs = {
+        'num_workers': args.workers,
+        'pin_memory': device.type == 'cuda',
+        'collate_fn': collate_fn,
+    }
+    if args.workers > 0:
+        loader_kwargs['persistent_workers'] = True
+        loader_kwargs['prefetch_factor'] = args.prefetch_factor
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.workers,
-        pin_memory=True,
-        collate_fn=collate_fn,
         drop_last=True,
+        **loader_kwargs,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.workers,
-        pin_memory=True,
-        collate_fn=collate_fn,
+        **loader_kwargs,
     )
 
     # ── Loss ──────────────────────────────────────────────────────
@@ -323,31 +383,59 @@ def train(args):
     # ── Checkpointing ─────────────────────────────────────────────
     os.makedirs(args.save_dir, exist_ok=True)
     best_loss = float('inf')
+    start_epoch = 0
+
+    if args.resume:
+        logger.info(f"Resuming from checkpoint: {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+
+        if 'optimizer_state_dict' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        if scaler is not None and 'scaler_state_dict' in checkpoint and checkpoint['scaler_state_dict'] is not None:
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+
+        start_epoch = int(checkpoint.get('epoch', 0))
+        best_loss = float(checkpoint.get('best_loss', checkpoint.get('loss', best_loss)))
+        logger.info(f"Resume state loaded | start_epoch={start_epoch} | best_loss={best_loss:.4f}")
 
     # ── Training ──────────────────────────────────────────────────
     logger.info("=" * 60)
     logger.info(f"  Training SecureYOLO v3")
     logger.info(f"  Epochs: {args.epochs} | Batch: {args.batch_size}")
     logger.info(f"  LR: {args.lr} | Adversarial: {args.adversarial}")
+    logger.info(f"  Steps per epoch: {len(train_loader)}")
+    if args.adversarial:
+        logger.info(
+            f"  Adversarial fine-tune starts at last {int(args.adversarial_finetune_ratio * 100)}% of epochs"
+        )
     logger.info("=" * 60)
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         epoch_losses = {'total': 0, 'box': 0, 'cls': 0, 'obj': 0}
         num_batches = 0
         epoch_start = time.time()
 
         for batch_idx, (images, targets) in enumerate(train_loader):
-            images = images.to(device)
+            images = images.to(device, non_blocking=(device.type == 'cuda'))
+            if device.type == 'cuda' and args.channels_last:
+                images = images.contiguous(memory_format=torch.channels_last)
             targets = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                       for k, v in targets.items()}
 
-            if adv_trainer and random.random() < args.adversarial_ratio:
+            adv_start_epoch = int(args.epochs * (1.0 - args.adversarial_finetune_ratio))
+            use_adv_epoch = adv_trainer is not None and epoch >= adv_start_epoch
+
+            if use_adv_epoch and random.random() < args.adversarial_ratio:
                 # Adversarial training step
                 adv_result = adv_trainer.training_step(
                     images, targets,
                     lambda out, tgt: loss_fn(out, tgt),
                     optimizer, args.num_classes,
+                    use_adversarial=True,
                 )
                 losses = adv_result
             else:
@@ -412,7 +500,10 @@ def train(args):
                     'epoch': epoch + 1,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
                     'loss': best_loss,
+                    'best_loss': best_loss,
                 }, save_path)
                 logger.info(f"  Saved best model → {save_path} (loss={best_loss:.4f})")
 
@@ -423,7 +514,10 @@ def train(args):
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
                 'loss': avg['total'],
+                'best_loss': best_loss,
             }, save_path)
             logger.info(f"  Checkpoint → {save_path}")
 
@@ -433,7 +527,10 @@ def train(args):
         'epoch': args.epochs,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
         'loss': avg['total'],
+        'best_loss': best_loss,
         'architecture': {
             'num_classes': args.num_classes,
             'fpn_channels': args.fpn_channels,
@@ -452,7 +549,7 @@ def validate(model, val_loader, loss_fn, device, use_amp):
 
     with torch.no_grad():
         for images, targets in val_loader:
-            images = images.to(device)
+            images = images.to(device, non_blocking=(device.type == 'cuda'))
             targets = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                       for k, v in targets.items()}
 
@@ -484,6 +581,8 @@ def parse_args():
                        help='COCO split to use for training (train or val)')
     parser.add_argument('--synthetic-size', type=int, default=2000,
                        help='Number of synthetic training samples')
+    parser.add_argument('--allow-synthetic', action='store_true',
+                       help='Allow fallback to synthetic data when COCO files are incomplete')
 
     # Model
     parser.add_argument('--num-classes', type=int, default=80)
@@ -492,13 +591,21 @@ def parse_args():
 
     # Training
     parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--batch-size', type=int, default=8)
+    parser.add_argument('--batch-size', type=int, default=16)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--weight-decay', type=float, default=5e-4)
     parser.add_argument('--warmup-epochs', type=int, default=3)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--workers', type=int, default=4,
                        help='Number of dataloader workers (increase to prevent GPU starvation)')
+    parser.add_argument('--prefetch-factor', type=int, default=4,
+                       help='Dataloader prefetch factor per worker')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed for reproducibility')
+    parser.add_argument('--channels-last', action='store_true', default=True,
+                       help='Use channels_last memory format on CUDA for higher throughput')
+    parser.add_argument('--allow-tf32', action='store_true', default=True,
+                       help='Enable TF32 matmul/convolution on CUDA (faster, negligible accuracy impact)')
 
     # Adversarial
     parser.add_argument('--adversarial', action='store_true', default=True,
@@ -506,16 +613,18 @@ def parse_args():
     parser.add_argument('--no-adversarial', dest='adversarial', action='store_false')
     parser.add_argument('--pgd-epsilon', type=float, default=2/255)
     parser.add_argument('--pgd-alpha', type=float, default=0.5/255)
-    parser.add_argument('--pgd-steps', type=int, default=3)
-    parser.add_argument('--adversarial-ratio', type=float, default=0.5)
-    parser.add_argument('--grad-reg-weight', type=float, default=0.1)
+    parser.add_argument('--pgd-steps', type=int, default=1)
+    parser.add_argument('--adversarial-ratio', type=float, default=0.2)
+    parser.add_argument('--adversarial-finetune-ratio', type=float, default=0.2,
+                       help='Fraction of final epochs where adversarial batches are enabled')
+    parser.add_argument('--grad-reg-weight', type=float, default=0.0)
     parser.add_argument('--label-smoothing', type=float, default=0.1)
 
     # Logging/Saving
     parser.add_argument('--save-dir', type=str, default='checkpoints')
-    parser.add_argument('--save-interval', type=int, default=10)
-    parser.add_argument('--val-interval', type=int, default=5)
-    parser.add_argument('--log-interval', type=int, default=10)
+    parser.add_argument('--save-interval', type=int, default=20)
+    parser.add_argument('--val-interval', type=int, default=10)
+    parser.add_argument('--log-interval', type=int, default=20)
 
     # Resume
     parser.add_argument('--resume', type=str, default=None,
@@ -526,12 +635,5 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-
-    if args.resume:
-        logger.info(f"Resuming from {args.resume}")
-        checkpoint = torch.load(args.resume, map_location=args.device)
-        model = SecureYOLO(args.num_classes, args.fpn_channels)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        logger.info(f"Loaded checkpoint from epoch {checkpoint['epoch']}")
 
     train(args)

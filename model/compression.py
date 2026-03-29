@@ -28,12 +28,15 @@ class StructuredPruner:
     channel count since it generates a new permutation per-boot).
     """
 
-    def __init__(self, prune_ratio: float = 0.2):
+    def __init__(self, prune_ratio: float = 0.2, enable_structural_rewrite: bool = False):
         """
         Args:
             prune_ratio: Fraction of channels to prune per eligible layer
+            enable_structural_rewrite: EXPERIMENTAL. If False, pruning rewrites are
+                disabled to avoid breaking non-sequential detector topologies.
         """
         self.prune_ratio = prune_ratio
+        self.enable_structural_rewrite = enable_structural_rewrite
 
     def compute_channel_importance(self, model: nn.Module) -> dict[str, torch.Tensor]:
         """Compute L1-norm importance scores for each Conv2d layer."""
@@ -52,12 +55,24 @@ class StructuredPruner:
         Returns:
             (pruned_model, pruning_stats)
         """
-        importance = self.compute_channel_importance(model)
         stats = {
             'layers_pruned': 0,
             'channels_removed': 0,
             'original_params': sum(p.numel() for p in model.parameters()),
         }
+
+        if not self.enable_structural_rewrite:
+            stats['pruned_params'] = stats['original_params']
+            stats['compression_ratio'] = 0.0
+            stats['skipped'] = True
+            stats['reason'] = (
+                "Structured channel rewrite is disabled by default because this model "
+                "contains multi-branch topology where naive channel edits are unsafe."
+            )
+            logger.warning(stats['reason'])
+            return model, stats
+
+        importance = self.compute_channel_importance(model)
 
         for name, module in model.named_modules():
             if name in importance and isinstance(module, nn.Conv2d):
@@ -90,6 +105,7 @@ class StructuredPruner:
             f"removed {stats['channels_removed']} channels, "
             f"compression: {stats['compression_ratio']:.1%}"
         )
+        stats['skipped'] = False
         return model, stats
 
 

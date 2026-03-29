@@ -155,14 +155,27 @@ class AdversarialRobustness:
         return result.to(tensor.device)
 
     @staticmethod
-    def preprocess_frame(frame_tensor: torch.Tensor, training: bool = False) -> torch.Tensor:
-        """Applies all inference-time defenses before the tensor hits the model."""
+    def preprocess_frame(
+        frame_tensor: torch.Tensor,
+        training: bool = False,
+        allow_cpu_transforms: Optional[bool] = None,
+    ) -> torch.Tensor:
+        """Applies runtime preprocessing before model inference.
+
+        allow_cpu_transforms:
+            - None: auto-disable CPU transforms on CUDA tensors
+            - True: allow CPU transforms like JPEG jitter
+            - False: keep the pipeline fully tensor/GPU based
+        """
+
+        if allow_cpu_transforms is None:
+            allow_cpu_transforms = not frame_tensor.is_cuda
 
         # 1. Random Resizing and Cropping
         processed = AdversarialRobustness._random_resizing(frame_tensor)
 
-        # 2. JPEG Compression Jitter (50% probability to balance speed)
-        if np.random.random() < 0.5:
+        # 2. JPEG Compression Jitter (CPU-bound; disabled automatically on CUDA paths)
+        if allow_cpu_transforms and np.random.random() < 0.5:
             processed = AdversarialRobustness._compression_jitter(processed)
 
         # 3. Gaussian Denoising/Perturbation

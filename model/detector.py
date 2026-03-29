@@ -16,6 +16,46 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _xywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
+    out = boxes.clone()
+    out[..., 0] = boxes[..., 0] - boxes[..., 2] / 2
+    out[..., 1] = boxes[..., 1] - boxes[..., 3] / 2
+    out[..., 2] = boxes[..., 0] + boxes[..., 2] / 2
+    out[..., 3] = boxes[..., 1] + boxes[..., 3] / 2
+    return out
+
+
+def _box_iou_xyxy(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+    area1 = (boxes1[:, 2] - boxes1[:, 0]).clamp(0) * (boxes1[:, 3] - boxes1[:, 1]).clamp(0)
+    area2 = (boxes2[:, 2] - boxes2[:, 0]).clamp(0) * (boxes2[:, 3] - boxes2[:, 1]).clamp(0)
+
+    lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])
+    rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[..., 0] * wh[..., 1]
+    union = area1[:, None] + area2 - inter + 1e-7
+    return inter / union
+
+
+def _nms_xyxy(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float) -> torch.Tensor:
+    if boxes.numel() == 0:
+        return boxes.new_zeros((0,), dtype=torch.long)
+
+    order = scores.argsort(descending=True)
+    keep = []
+
+    while order.numel() > 0:
+        i = order[0]
+        keep.append(i)
+        if order.numel() == 1:
+            break
+
+        ious = _box_iou_xyxy(boxes[i].unsqueeze(0), boxes[order[1:]]).squeeze(0)
+        order = order[1:][ious <= iou_threshold]
+
+    return torch.stack(keep) if keep else boxes.new_zeros((0,), dtype=torch.long)
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  Core Building Blocks
 # ══════════════════════════════════════════════════════════════════════
@@ -191,6 +231,12 @@ class SecureYOLO(nn.Module):
         super().__init__()
         self.num_classes = num_classes
         self.fpn_channels = fpn_channels
+        self.anchors = (
+            ((10.0, 13.0), (16.0, 30.0), (33.0, 23.0)),
+            ((30.0, 61.0), (62.0, 45.0), (59.0, 119.0)),
+            ((116.0, 90.0), (156.0, 198.0), (373.0, 326.0)),
+        )
+        self.strides = (8, 16, 32)
         self.num_outputs = 3 * (5 + num_classes)  # 3 anchors per scale
 
         # ── Backbone (CSP stages producing P3, P4, P5) ────────
@@ -238,7 +284,7 @@ class SecureYOLO(nn.Module):
         self.head_p4 = nn.Conv2d(fpn_channels, self.num_outputs, 1)
         self.head_p5 = nn.Conv2d(fpn_channels, self.num_outputs, 1)
 
-    def forward(self, x):
+    def _forward_raw_scales(self, x):
         # ── Backbone ──────────────────────────────────────────
         s = self.stem(x)
         s1 = self.stage1(s)
@@ -284,17 +330,27 @@ class SecureYOLO(nn.Module):
             p4.zero_(); del p4
             p5.zero_(); del p5
 
-        # Flatten and concatenate all scales:
-        # Each output: [B, num_outputs, H, W] → [B, H*W*3, 5+num_classes]
         b = out_p3.shape[0]
-        det_p3 = out_p3.permute(0, 2, 3, 1).reshape(b, -1, 5 + self.num_classes)
-        det_p4 = out_p4.permute(0, 2, 3, 1).reshape(b, -1, 5 + self.num_classes)
-        det_p5 = out_p5.permute(0, 2, 3, 1).reshape(b, -1, 5 + self.num_classes)
+        raw_p3 = out_p3.view(b, 3, 5 + self.num_classes, out_p3.shape[2], out_p3.shape[3]).permute(0, 1, 3, 4, 2).contiguous()
+        raw_p4 = out_p4.view(b, 3, 5 + self.num_classes, out_p4.shape[2], out_p4.shape[3]).permute(0, 1, 3, 4, 2).contiguous()
+        raw_p5 = out_p5.view(b, 3, 5 + self.num_classes, out_p5.shape[2], out_p5.shape[3]).permute(0, 1, 3, 4, 2).contiguous()
 
         if not self.training:
             out_p3.zero_(); del out_p3
             out_p4.zero_(); del out_p4
             out_p5.zero_(); del out_p5
+
+        return raw_p3, raw_p4, raw_p5
+
+    def forward(self, x):
+        raw_p3, raw_p4, raw_p5 = self._forward_raw_scales(x)
+
+        # Flatten and concatenate all scales:
+        # Each output: [B, num_outputs, H, W] → [B, H*W*3, 5+num_classes]
+        b = raw_p3.shape[0]
+        det_p3 = raw_p3.reshape(b, -1, 5 + self.num_classes)
+        det_p4 = raw_p4.reshape(b, -1, 5 + self.num_classes)
+        det_p5 = raw_p5.reshape(b, -1, 5 + self.num_classes)
 
         detections = torch.cat([det_p3, det_p4, det_p5], dim=1)
 
@@ -305,9 +361,114 @@ class SecureYOLO(nn.Module):
 
         return detections
 
+    def _decode_scale(self, raw_scale: torch.Tensor, stride: int, anchors, image_hw: tuple[int, int]) -> torch.Tensor:
+        b, n_a, h, w, _ = raw_scale.shape
+        device = raw_scale.device
+        img_h, img_w = image_hw
+
+        yv, xv = torch.meshgrid(
+            torch.arange(h, device=device),
+            torch.arange(w, device=device),
+            indexing='ij'
+        )
+        grid = torch.stack((xv, yv), dim=-1).float().view(1, 1, h, w, 2)
+
+        anchor_tensor = torch.tensor(anchors, device=device, dtype=raw_scale.dtype).view(1, n_a, 1, 1, 2)
+
+        tx_ty = raw_scale[..., 0:2]
+        tw_th = raw_scale[..., 2:4]
+        obj = raw_scale[..., 4:5]
+        cls = raw_scale[..., 5:]
+
+        xy = (torch.sigmoid(tx_ty) + grid) * stride
+        wh = torch.exp(tw_th).clamp(max=1e3) * anchor_tensor
+
+        decoded = torch.cat([
+            xy[..., 0:1] / max(float(img_w), 1.0),
+            xy[..., 1:2] / max(float(img_h), 1.0),
+            wh[..., 0:1] / max(float(img_w), 1.0),
+            wh[..., 1:2] / max(float(img_h), 1.0),
+            torch.sigmoid(obj),
+            torch.sigmoid(cls),
+        ], dim=-1)
+
+        decoded[..., :4] = decoded[..., :4].clamp(0.0, 1.0)
+        return decoded.view(b, -1, 5 + self.num_classes)
+
+    @torch.no_grad()
+    def predict(self, frame_tensor: torch.Tensor, conf_threshold: float = 0.35,
+                iou_threshold: float = 0.45, max_detections: int = 300,
+                pre_nms_topk: int = 1000) -> torch.Tensor:
+        was_training = self.training
+        self.eval()
+
+        raw_scales = self._forward_raw_scales(frame_tensor)
+        image_hw = (frame_tensor.shape[-2], frame_tensor.shape[-1])
+
+        decoded = [
+            self._decode_scale(raw_scales[0], self.strides[0], self.anchors[0], image_hw),
+            self._decode_scale(raw_scales[1], self.strides[1], self.anchors[1], image_hw),
+            self._decode_scale(raw_scales[2], self.strides[2], self.anchors[2], image_hw),
+        ]
+
+        pred = torch.cat(decoded, dim=1)
+        b = pred.shape[0]
+        out = pred.new_zeros((b, max_detections, 5 + self.num_classes))
+
+        for bi in range(b):
+            boxes_xywh = pred[bi, :, :4]
+            obj = pred[bi, :, 4]
+            cls_probs = pred[bi, :, 5:]
+
+            cls_conf, cls_idx = cls_probs.max(dim=1)
+            scores = obj * cls_conf
+            keep_mask = scores > conf_threshold
+            if keep_mask.sum() == 0:
+                continue
+
+            boxes_xywh = boxes_xywh[keep_mask]
+            scores = scores[keep_mask]
+            obj = obj[keep_mask]
+            cls_idx = cls_idx[keep_mask]
+
+            # Bound NMS complexity by capping candidate count.
+            if pre_nms_topk > 0 and scores.numel() > pre_nms_topk:
+                topk = torch.topk(scores, pre_nms_topk, largest=True).indices
+                boxes_xywh = boxes_xywh[topk]
+                scores = scores[topk]
+                obj = obj[topk]
+                cls_idx = cls_idx[topk]
+
+            boxes_xyxy = _xywh_to_xyxy(boxes_xywh).clamp(0.0, 1.0)
+
+            final_keep = []
+            for c in cls_idx.unique():
+                c_mask = cls_idx == c
+                c_keep = _nms_xyxy(boxes_xyxy[c_mask], scores[c_mask], iou_threshold)
+                if c_keep.numel() > 0:
+                    c_indices = torch.where(c_mask)[0][c_keep]
+                    final_keep.append(c_indices)
+
+            if not final_keep:
+                continue
+
+            final_keep = torch.cat(final_keep)
+            final_keep = final_keep[scores[final_keep].argsort(descending=True)]
+            final_keep = final_keep[:max_detections]
+
+            n = final_keep.numel()
+            out[bi, :n, :4] = boxes_xywh[final_keep]
+            out[bi, :n, 4] = obj[final_keep]
+            out[bi, :n, 5:] = 0.0
+            out[bi, torch.arange(n, device=out.device), 5 + cls_idx[final_keep]] = 1.0
+
+        if was_training:
+            self.train()
+        return out
+
     @torch.no_grad()
     def secure_forward(self, frame_tensor: torch.Tensor) -> torch.Tensor:
         """Inference-only forward with input cleanup."""
-        out = self.forward(frame_tensor)
+        out = self.predict(frame_tensor)
         frame_tensor.zero_()
         return out

@@ -97,12 +97,15 @@ class AdversarialTrainer:
         Input gradient regularization: penalize ‖∂L/∂x‖₂ to smooth
         the loss landscape and improve adversarial robustness.
         """
+        if self.grad_reg_weight <= 0:
+            return torch.tensor(0.0, device=images.device)
+
         images_grad = images.clone().detach().requires_grad_(True)
         outputs = self.model(images_grad)
         loss = loss_fn(outputs, targets)
 
         input_grad = torch.autograd.grad(
-            loss, images_grad, create_graph=True, retain_graph=True
+            loss, images_grad, create_graph=False, retain_graph=False
         )[0]
 
         grad_norm = input_grad.norm(p=2, dim=(1, 2, 3)).mean()
@@ -124,6 +127,7 @@ class AdversarialTrainer:
         loss_fn: Callable,
         optimizer: torch.optim.Optimizer,
         num_classes: int = 80,
+        use_adversarial: bool = True,
     ) -> dict:
         """
         Execute one adversarial training step.
@@ -131,9 +135,6 @@ class AdversarialTrainer:
         Returns:
             dict with loss components
         """
-        # Decide whether this batch gets adversarial treatment
-        use_adversarial = torch.rand(1).item() < self.adversarial_ratio
-
         # Label smoothing
         if 'classes' in targets:
             targets['classes'] = self.smooth_labels(targets['classes'], num_classes)
@@ -143,16 +144,31 @@ class AdversarialTrainer:
             def _loss_fn(outputs, tgt):
                 return loss_fn(outputs, tgt)['total']
 
-            adv_images = self.generate_adversarial(images, _loss_fn, targets)
+            try:
+                adv_images = self.generate_adversarial(images, _loss_fn, targets)
 
-            # Forward on adversarial
-            self.model.train()
-            outputs = self.model(adv_images)
-            losses = loss_fn(outputs, targets)
+                # Forward on adversarial
+                self.model.train()
+                outputs = self.model(adv_images)
+                losses = loss_fn(outputs, targets)
 
-            # Add gradient regularization on clean images
-            grad_reg = self.compute_gradient_regularization(images, _loss_fn, targets)
-            total_loss = losses['total'] + grad_reg
+                # Add gradient regularization on clean images
+                grad_reg = self.compute_gradient_regularization(images, _loss_fn, targets)
+                total_loss = losses['total'] + grad_reg
+            except (torch.OutOfMemoryError, RuntimeError) as e:
+                if isinstance(e, RuntimeError) and "cuda" not in str(e).lower() and "memory" not in str(e).lower():
+                    raise
+                # Fallback path: recover this batch with clean training instead of aborting the run.
+                logger.warning("CUDA failure during adversarial step; falling back to clean step for this batch.")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                self.model.train()
+                outputs = self.model(images)
+                losses = loss_fn(outputs, targets)
+                total_loss = losses['total']
+                grad_reg = torch.tensor(0.0, device=images.device)
+                use_adversarial = False
         else:
             # Clean forward pass
             self.model.train()
