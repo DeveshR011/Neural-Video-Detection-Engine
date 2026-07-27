@@ -1,639 +1,445 @@
 """
-SecureYOLO v3 Training Script
-================================
-End-to-end training with:
-- COCO-format dataset loading
-- CIoU + Focal loss
-- PGD adversarial training (lightweight 3-step)
-- Mixed precision (FP16)
-- Cosine LR schedule with warmup
-- Model checkpointing with encrypted export
+SecureYOLO Training
+===================
+Training entry point for the anchor-free detector.
+
+    py -3.14 train.py --dataset voc  --data-root ./VOCdevkit --epochs 60
+    py -3.14 train.py --dataset coco --data-root ./coco       --epochs 40
+
+Implements the pieces that matter for accuracy under a short compute budget:
+EMA weight averaging, bf16 autocast, gradient accumulation to reach an
+effective batch size larger than 6 GB of VRAM allows, cosine decay with
+warmup, and mosaic disabled for the final epochs.
+
+Every run writes to ``runs/<name>/`` with checkpoints, a metrics CSV, and the
+resolved configuration, so a result can be traced back to what produced it.
 """
 
-import os
-import sys
-import math
-import time
-import json
-import random
-import logging
 import argparse
-import warnings
+import csv
+import json
+import logging
+import math
+import os
+import random
+import sys
+import time
+from copy import deepcopy
 from pathlib import Path
-from typing import Optional
 
-# Suppress PyTorch's harmless AMP scheduler warning that triggers when AMP skips the first batch due to random initialization NaNs.
-warnings.filterwarnings("ignore", category=UserWarning, message=".*Detected call of `lr_scheduler.step()`.*")
-
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-from torch.utils.data import Dataset, DataLoader
 
+from data.build import build_dataloaders
+from evaluation.coco_eval import evaluate, format_metrics
+from model.detection_loss import DetectionLoss
 from model.detector import SecureYOLO
-from model.losses import CIoULoss, FocalLoss, DetectionLoss
-from model.adversarial_trainer import AdversarialTrainer
-from model.compression import MixedPrecisionTrainer
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(name)-14s | %(levelname)-7s | %(message)s",
+    format="%(asctime)s | %(name)-10s | %(levelname)-5s | %(message)s",
+    datefmt="%H:%M:%S",
 )
-logger = logging.getLogger("Training")
+logger = logging.getLogger("Train")
 
 
-def set_seed(seed: int):
-    """Set random seeds for reproducible experiments."""
+def set_seed(seed: int, deterministic: bool = False):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  Dataset
-# ══════════════════════════════════════════════════════════════════════
-
-class COCODetectionDataset(Dataset):
-    """
-    COCO-format detection dataset.
-    
-    Expected structure:
-        data_root/
-        ├── images/
-        │   ├── train2017/
-        │   └── val2017/
-        └── annotations/
-            ├── instances_train2017.json
-            └── instances_val2017.json
-    
-    If no dataset is available, generates synthetic training data
-    to demonstrate the training pipeline.
-    """
-
-    def __init__(self, data_root: str = None, split: str = "train",
-                 img_size: int = 640, num_classes: int = 80,
-                 max_objects: int = 50, synthetic_size: int = 1000,
-                 allow_synthetic_fallback: bool = False):
-        self.img_size = img_size
-        self.num_classes = num_classes
-        self.max_objects = max_objects
-        self.allow_synthetic_fallback = allow_synthetic_fallback
-        self.use_synthetic = data_root is None
-
-        if self.use_synthetic:
-            logger.info(f"No dataset at '{data_root}' — using synthetic data ({synthetic_size} samples)")
-            self.length = synthetic_size
-            self.annotations = None
-        else:
-            if not os.path.exists(data_root):
-                if self.allow_synthetic_fallback:
-                    logger.warning(f"Dataset root '{data_root}' does not exist. Falling back to synthetic data.")
-                    self.use_synthetic = True
-                    self.length = synthetic_size
-                    self.annotations = None
-                    return
-                raise FileNotFoundError(f"Dataset root does not exist: {data_root}")
-            self._load_coco(data_root, split)
-
-    def _load_coco(self, data_root: str, split: str):
-        """Load COCO annotations."""
-        ann_file = os.path.join(data_root, "annotations", f"instances_{split}2017.json")
-        img_dir = os.path.join(data_root, "images", f"{split}2017")
-
-        if not os.path.exists(ann_file):
-            if self.allow_synthetic_fallback:
-                logger.warning(f"Annotation file not found: {ann_file}. Falling back to synthetic data.")
-                self.use_synthetic = True
-                self.length = 1000
-                return
-            raise FileNotFoundError(f"Missing annotation file: {ann_file}")
-        if not os.path.exists(img_dir):
-            if self.allow_synthetic_fallback:
-                logger.warning(f"Image directory not found: {img_dir}. Falling back to synthetic data.")
-                self.use_synthetic = True
-                self.length = 1000
-                return
-            raise FileNotFoundError(f"Missing image directory: {img_dir}")
-
-        try:
-            with open(ann_file, 'r') as f:
-                coco_data = json.load(f)
-
-            self.images = {img['id']: img for img in coco_data['images']}
-            self.img_dir = img_dir
-
-            # Group annotations by image
-            self.img_annotations = {}
-            for ann in coco_data['annotations']:
-                img_id = ann['image_id']
-                if img_id not in self.img_annotations:
-                    self.img_annotations[img_id] = []
-                self.img_annotations[img_id].append(ann)
-
-            self.img_ids = list(self.img_annotations.keys())
-            self.length = len(self.img_ids)
-
-            # Build category mapping
-            self.cat_to_idx = {cat['id']: idx for idx, cat in
-                              enumerate(coco_data['categories'])}
-
-            missing = 0
-            for img_id in self.img_ids:
-                file_name = self.images[img_id]['file_name']
-                if not os.path.exists(os.path.join(self.img_dir, file_name)):
-                    missing += 1
-            if missing > 0:
-                message = f"COCO split '{split}' has {missing} missing image files under {self.img_dir}."
-                if self.allow_synthetic_fallback:
-                    logger.warning(message + " Falling back to synthetic data.")
-                    self.use_synthetic = True
-                    self.length = 1000
-                    return
-                raise FileNotFoundError(message)
-
-            logger.info(f"Loaded {self.length} images from {split} split")
-        except Exception as e:
-            if self.allow_synthetic_fallback:
-                logger.warning(f"Failed to load COCO: {e}. Falling back to synthetic data.")
-                self.use_synthetic = True
-                self.length = 1000
-            else:
-                raise
-
-    def __len__(self):
-        return self.length
-
-    def __getitem__(self, idx):
-        if self.use_synthetic:
-            return self._generate_synthetic()
-        else:
-            return self._load_real(idx)
-
-    def _generate_synthetic(self) -> tuple:
-        """Generate a synthetic training sample with random objects."""
-        # Random image
-        image = torch.rand(3, self.img_size, self.img_size)
-
-        # Random objects (1–10 per image)
-        n_objects = random.randint(1, 10)
-
-        boxes = torch.zeros(self.max_objects, 4)
-        classes = torch.zeros(self.max_objects, self.num_classes)
-        obj_mask = torch.zeros(self.max_objects)
-
-        for i in range(n_objects):
-            # Random box (cx, cy, w, h) normalized to [0, 1]
-            cx = random.uniform(0.1, 0.9)
-            cy = random.uniform(0.1, 0.9)
-            w = random.uniform(0.05, 0.4)
-            h = random.uniform(0.05, 0.4)
-
-            boxes[i] = torch.tensor([cx, cy, w, h])
-            cls = random.randint(0, self.num_classes - 1)
-            classes[i, cls] = 1.0
-            obj_mask[i] = 1.0
-
-        targets = {
-            'boxes': boxes,
-            'classes': classes,
-            'obj_mask': obj_mask,
-            'num_objects': n_objects,
-        }
-
-        return image, targets
-
-    def _load_real(self, idx) -> tuple:
-        """Load a real COCO image and its annotations."""
-        import cv2
-
-        img_id = self.img_ids[idx]
-        img_info = self.images[img_id]
-        img_path = os.path.join(self.img_dir, img_info['file_name'])
-
-        # Load and resize image
-        img = cv2.imread(img_path)
-        if img is None:
-            raise FileNotFoundError(f"Failed to load COCO image: {img_path}")
-
-        h_orig, w_orig = img.shape[:2]
-        img = cv2.resize(img, (self.img_size, self.img_size))
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        image = torch.from_numpy(img).float().permute(2, 0, 1) / 255.0
-
-        # Process annotations
-        anns = self.img_annotations.get(img_id, [])
-        boxes = torch.zeros(self.max_objects, 4)
-        classes = torch.zeros(self.max_objects, self.num_classes)
-        obj_mask = torch.zeros(self.max_objects)
-
-        for i, ann in enumerate(anns[:self.max_objects]):
-            x, y, w, h = ann['bbox']  # COCO format: x, y, w, h (absolute)
-            # Convert to normalized center format
-            cx = (x + w / 2) / w_orig
-            cy = (y + h / 2) / h_orig
-            nw = w / w_orig
-            nh = h / h_orig
-
-            boxes[i] = torch.tensor([cx, cy, nw, nh]).clamp(0, 1)
-
-            cat_idx = self.cat_to_idx.get(ann['category_id'], 0)
-            if cat_idx < self.num_classes:
-                classes[i, cat_idx] = 1.0
-            obj_mask[i] = 1.0
-
-        targets = {
-            'boxes': boxes,
-            'classes': classes,
-            'obj_mask': obj_mask,
-            'num_objects': min(len(anns), self.max_objects),
-        }
-
-        return image, targets
-
-
-def collate_fn(batch):
-    """Custom collate for detection data."""
-    images = torch.stack([b[0] for b in batch])
-    targets = {
-        'boxes': torch.stack([b[1]['boxes'] for b in batch]),
-        'classes': torch.stack([b[1]['classes'] for b in batch]),
-        'obj_mask': torch.stack([b[1]['obj_mask'] for b in batch]),
-    }
-    return images, targets
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  Training Loop
-# ══════════════════════════════════════════════════════════════════════
-
-def train(args):
-    """Main training function."""
-    set_seed(args.seed)
-    device = torch.device(args.device)
-    logger.info(f"Device: {device}")
-    logger.info(f"Seed: {args.seed}")
-    
-    if device.type == 'cuda':
-        # Auto-tune convolution algorithms for maximum hardware efficiency
+    torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    else:
         torch.backends.cudnn.benchmark = True
-        if args.allow_tf32:
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            torch.set_float32_matmul_precision('high')
-        logger.info("Enabled CuDNN Benchmark for maximum throughput")
 
-    # ── Model ─────────────────────────────────────────────────────
-    model = SecureYOLO(
-        num_classes=args.num_classes,
-        fpn_channels=args.fpn_channels,
-    ).to(device)
-    if device.type == 'cuda' and args.channels_last:
-        model = model.to(memory_format=torch.channels_last)
 
-    param_count = sum(p.numel() for p in model.parameters())
-    logger.info(f"Model: SecureYOLO v3 | Params: {param_count:,}")
+class ModelEMA:
+    """Exponential moving average of model weights.
 
-    # ── Dataset ───────────────────────────────────────────────────
-    train_dataset = COCODetectionDataset(
-        data_root=args.data,
-        split=args.train_split,
-        img_size=args.img_size,
-        num_classes=args.num_classes,
-        synthetic_size=args.synthetic_size,
-        allow_synthetic_fallback=args.allow_synthetic,
-    )
-    val_dataset = COCODetectionDataset(
-        data_root=args.data,
-        split="val",
-        img_size=args.img_size,
-        num_classes=args.num_classes,
-        synthetic_size=args.synthetic_size // 5,
-        allow_synthetic_fallback=args.allow_synthetic,
-    )
+    The averaged weights are consistently better than the final weights,
+    typically by 1-2 mAP, because they suppress the noise of late-training SGD
+    steps. The decay ramps in from a low value so the average is not anchored
+    to the random initialization.
+    """
 
-    loader_kwargs = {
-        'num_workers': args.workers,
-        'pin_memory': device.type == 'cuda',
-        'collate_fn': collate_fn,
+    def __init__(self, model, decay=0.9999, tau=2000, updates=0):
+        self.ema = deepcopy(self._bare(model)).eval()
+        self.updates = updates
+        self.decay_fn = lambda x: decay * (1 - math.exp(-x / tau))
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+
+    @staticmethod
+    def _bare(model):
+        return model.module if hasattr(model, "module") else model
+
+    @torch.no_grad()
+    def update(self, model):
+        self.updates += 1
+        d = self.decay_fn(self.updates)
+        msd = self._bare(model).state_dict()
+        for k, v in self.ema.state_dict().items():
+            if v.dtype.is_floating_point:
+                v *= d
+                v += (1 - d) * msd[k].detach()
+            else:
+                # Integer buffers (e.g. num_batches_tracked) are copied, not averaged.
+                v.copy_(msd[k])
+
+
+def build_optimizer(model, name="auto", lr=0.001, momentum=0.937, weight_decay=0.0005):
+    """Build an optimizer with decay applied only to convolution/linear weights.
+
+    Applying weight decay to BatchNorm parameters and biases measurably hurts
+    detection accuracy, so they are placed in separate parameter groups.
+    """
+    decay, no_decay = [], []
+    for module in model.modules():
+        for param_name, param in module.named_parameters(recurse=False):
+            if not param.requires_grad:
+                continue
+            if param_name == "bias" or isinstance(module, (nn.BatchNorm2d, nn.GroupNorm)):
+                no_decay.append(param)
+            else:
+                decay.append(param)
+
+    groups = [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+
+    if name == "auto":
+        name = "adamw"
+    name = name.lower()
+
+    if name == "adamw":
+        optimizer = torch.optim.AdamW(groups, lr=lr, betas=(momentum, 0.999))
+    elif name == "sgd":
+        optimizer = torch.optim.SGD(groups, lr=lr, momentum=momentum, nesterov=True)
+    else:
+        raise ValueError(f"Unknown optimizer {name!r}")
+
+    logger.info("Optimizer %s | lr %g | decay params %d | no-decay params %d",
+                name, lr, len(decay), len(no_decay))
+    return optimizer
+
+
+def cosine_schedule(epoch, epochs, lr_final_ratio=0.01, warmup_epochs=3.0):
+    """Warmup followed by cosine decay, returned as a multiplier on base lr."""
+    if epoch < warmup_epochs:
+        return (epoch + 1) / (warmup_epochs + 1e-8)
+    progress = (epoch - warmup_epochs) / max(epochs - warmup_epochs, 1)
+    progress = min(max(progress, 0.0), 1.0)
+    return lr_final_ratio + (1 - lr_final_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+
+
+def save_checkpoint(path, model, ema, optimizer, epoch, best_map, args, class_names):
+    payload = {
+        "epoch": epoch,
+        "best_map": best_map,
+        "model": model.state_dict(),
+        "ema": ema.ema.state_dict() if ema else None,
+        "ema_updates": ema.updates if ema else 0,
+        "optimizer": optimizer.state_dict(),
+        "args": vars(args),
+        "class_names": class_names,
     }
-    if args.workers > 0:
-        loader_kwargs['persistent_workers'] = True
-        loader_kwargs['prefetch_factor'] = args.prefetch_factor
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, path)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        drop_last=True,
-        **loader_kwargs,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        **loader_kwargs,
-    )
 
-    # ── Loss ──────────────────────────────────────────────────────
-    loss_fn = DetectionLoss(
-        num_classes=args.num_classes,
-        lambda_box=5.0,
-        lambda_cls=1.0,
-        lambda_obj=1.0,
-        lambda_jitter=0.1,
-    )
+def train_one_epoch(model, loader, loss_fn, optimizer, scaler, device, epoch,
+                    args, ema=None, amp_dtype=None, accumulate=1):
+    model.train()
+    n_batches = len(loader)
+    totals = {"box": 0.0, "cls": 0.0, "dfl": 0.0, "total": 0.0}
+    seen = 0
+    start = time.perf_counter()
 
-    # ── Optimizer + Scheduler ─────────────────────────────────────
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+    optimizer.zero_grad(set_to_none=True)
 
-    # Cosine decay with warmup
-    total_steps = len(train_loader) * args.epochs
-    warmup_steps = len(train_loader) * args.warmup_epochs
+    for bi, (images, targets) in enumerate(loader):
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
 
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return step / max(warmup_steps, 1)
-        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
-        return 0.5 * (1 + math.cos(math.pi * progress))
+        if amp_dtype is not None:
+            with torch.autocast(device_type=device.type, dtype=amp_dtype):
+                preds = model(images)
+                loss, components = loss_fn(preds, targets,
+                                           imgsz=images.shape[-2:])
+        else:
+            preds = model(images)
+            loss, components = loss_fn(preds, targets, imgsz=images.shape[-2:])
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        # Scale so gradient magnitude is independent of the accumulation count.
+        scaled = loss / accumulate
 
-    # ── Adversarial Trainer ───────────────────────────────────────
-    adv_trainer = AdversarialTrainer(
-        model=model,
-        pgd_epsilon=args.pgd_epsilon,
-        pgd_alpha=args.pgd_alpha,
-        pgd_steps=args.pgd_steps,
-        grad_reg_weight=args.grad_reg_weight,
-        label_smoothing=args.label_smoothing,
-        adversarial_ratio=args.adversarial_ratio,
-    ) if args.adversarial else None
+        if scaler is not None:
+            scaler.scale(scaled).backward()
+        else:
+            scaled.backward()
 
-    # ── Mixed Precision ───────────────────────────────────────────
-    scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
-    use_amp = device.type == 'cuda'
-
-    # ── Checkpointing ─────────────────────────────────────────────
-    os.makedirs(args.save_dir, exist_ok=True)
-    best_loss = float('inf')
-    start_epoch = 0
-
-    if args.resume:
-        logger.info(f"Resuming from checkpoint: {args.resume}")
-        checkpoint = torch.load(args.resume, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-
-        if 'optimizer_state_dict' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        if 'scheduler_state_dict' in checkpoint:
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        if scaler is not None and 'scaler_state_dict' in checkpoint and checkpoint['scaler_state_dict'] is not None:
-            scaler.load_state_dict(checkpoint['scaler_state_dict'])
-
-        start_epoch = int(checkpoint.get('epoch', 0))
-        best_loss = float(checkpoint.get('best_loss', checkpoint.get('loss', best_loss)))
-        logger.info(f"Resume state loaded | start_epoch={start_epoch} | best_loss={best_loss:.4f}")
-
-    # ── Training ──────────────────────────────────────────────────
-    logger.info("=" * 60)
-    logger.info(f"  Training SecureYOLO v3")
-    logger.info(f"  Epochs: {args.epochs} | Batch: {args.batch_size}")
-    logger.info(f"  LR: {args.lr} | Adversarial: {args.adversarial}")
-    logger.info(f"  Steps per epoch: {len(train_loader)}")
-    if args.adversarial:
-        logger.info(
-            f"  Adversarial fine-tune starts at last {int(args.adversarial_finetune_ratio * 100)}% of epochs"
-        )
-    logger.info("=" * 60)
-
-    for epoch in range(start_epoch, args.epochs):
-        model.train()
-        epoch_losses = {'total': 0, 'box': 0, 'cls': 0, 'obj': 0}
-        num_batches = 0
-        epoch_start = time.time()
-
-        for batch_idx, (images, targets) in enumerate(train_loader):
-            images = images.to(device, non_blocking=(device.type == 'cuda'))
-            if device.type == 'cuda' and args.channels_last:
-                images = images.contiguous(memory_format=torch.channels_last)
-            targets = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                      for k, v in targets.items()}
-
-            adv_start_epoch = int(args.epochs * (1.0 - args.adversarial_finetune_ratio))
-            use_adv_epoch = adv_trainer is not None and epoch >= adv_start_epoch
-
-            if use_adv_epoch and random.random() < args.adversarial_ratio:
-                # Adversarial training step
-                adv_result = adv_trainer.training_step(
-                    images, targets,
-                    lambda out, tgt: loss_fn(out, tgt),
-                    optimizer, args.num_classes,
-                    use_adversarial=True,
-                )
-                losses = adv_result
+        if (bi + 1) % accumulate == 0 or (bi + 1) == n_batches:
+            if scaler is not None:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+                scaler.step(optimizer)
+                scaler.update()
             else:
-                # Standard training step
-                if use_amp:
-                    with torch.amp.autocast('cuda'):
-                        predictions = model(images)
-                        losses = loss_fn(predictions, targets)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            if ema is not None:
+                ema.update(model)
 
-                    optimizer.zero_grad()
-                    scaler.scale(losses['total']).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    predictions = model(images)
-                    losses = loss_fn(predictions, targets)
+        for k in totals:
+            totals[k] += components[k]
+        seen += 1
 
-                    optimizer.zero_grad()
-                    losses['total'].backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
-                    optimizer.step()
+        if args.log_interval and (bi + 1) % args.log_interval == 0:
+            elapsed = time.perf_counter() - start
+            ips = ((bi + 1) * images.shape[0]) / elapsed
+            mem = (torch.cuda.max_memory_allocated() / 1e9
+                   if device.type == "cuda" else 0.0)
+            logger.info(
+                "  e%-3d %5d/%-5d loss %7.3f (box %.3f cls %.3f dfl %.3f) "
+                "pos %4d | %5.1f img/s | %.2f GB",
+                epoch, bi + 1, n_batches, totals["total"] / seen,
+                totals["box"] / seen, totals["cls"] / seen, totals["dfl"] / seen,
+                components["n_positives"], ips, mem,
+            )
 
-            scheduler.step()
-
-            # Accumulate losses
-            for k in epoch_losses:
-                epoch_losses[k] += losses.get(k, 0) if isinstance(losses.get(k, 0), (int, float)) else losses.get(k, torch.tensor(0)).item() if isinstance(losses.get(k, 0), torch.Tensor) else 0
-            num_batches += 1
-
-            # Log every N batches
-            if (batch_idx + 1) % args.log_interval == 0:
-                avg = {k: v / num_batches for k, v in epoch_losses.items()}
-                lr = optimizer.param_groups[0]['lr']
-                logger.info(
-                    f"Epoch {epoch+1}/{args.epochs} [{batch_idx+1}/{len(train_loader)}] | "
-                    f"Loss: {avg['total']:.4f} (box={avg['box']:.4f} cls={avg['cls']:.4f} obj={avg['obj']:.4f}) | "
-                    f"LR: {lr:.6f}"
-                )
-
-        # ── Epoch Summary ─────────────────────────────────────────
-        epoch_time = time.time() - epoch_start
-        avg = {k: v / max(num_batches, 1) for k, v in epoch_losses.items()}
-
-        logger.info(
-            f"Epoch {epoch+1}/{args.epochs} complete | "
-            f"Time: {epoch_time:.1f}s | "
-            f"Loss: {avg['total']:.4f}"
-        )
-
-        # ── Validation ────────────────────────────────────────────
-        if (epoch + 1) % args.val_interval == 0:
-            val_loss = validate(model, val_loader, loss_fn, device, use_amp)
-            logger.info(f"Validation Loss: {val_loss:.4f}")
-
-            # Save best model
-            if val_loss < best_loss:
-                best_loss = val_loss
-                save_path = os.path.join(args.save_dir, "best.pt")
-                torch.save({
-                    'epoch': epoch + 1,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
-                    'loss': best_loss,
-                    'best_loss': best_loss,
-                }, save_path)
-                logger.info(f"  Saved best model → {save_path} (loss={best_loss:.4f})")
-
-        # ── Periodic checkpoint ───────────────────────────────────
-        if (epoch + 1) % args.save_interval == 0:
-            save_path = os.path.join(args.save_dir, f"epoch_{epoch+1}.pt")
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
-                'loss': avg['total'],
-                'best_loss': best_loss,
-            }, save_path)
-            logger.info(f"  Checkpoint → {save_path}")
-
-    # ── Final save ────────────────────────────────────────────────
-    final_path = os.path.join(args.save_dir, "final.pt")
-    torch.save({
-        'epoch': args.epochs,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
-        'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
-        'loss': avg['total'],
-        'best_loss': best_loss,
-        'architecture': {
-            'num_classes': args.num_classes,
-            'fpn_channels': args.fpn_channels,
-        },
-    }, final_path)
-    logger.info(f"Training complete. Final model → {final_path}")
-
-    return model
+    elapsed = time.perf_counter() - start
+    return {k: v / max(seen, 1) for k, v in totals.items()}, elapsed
 
 
-def validate(model, val_loader, loss_fn, device, use_amp):
-    """Run validation and return average loss."""
-    model.eval()
-    total_loss = 0
-    num_batches = 0
-
-    with torch.no_grad():
-        for images, targets in val_loader:
-            images = images.to(device, non_blocking=(device.type == 'cuda'))
-            targets = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                      for k, v in targets.items()}
-
-            if use_amp:
-                with torch.amp.autocast('cuda'):
-                    predictions = model(images)
-                    losses = loss_fn(predictions, targets)
-            else:
-                predictions = model(images)
-                losses = loss_fn(predictions, targets)
-
-            total_loss += losses['total'].item() if isinstance(losses['total'], torch.Tensor) else losses['total']
-            num_batches += 1
-
-    return total_loss / max(num_batches, 1)
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  CLI
-# ══════════════════════════════════════════════════════════════════════
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="SecureYOLO v3 Training")
+def main():
+    parser = argparse.ArgumentParser(description="Train SecureYOLO")
 
     # Data
-    parser.add_argument('--data', type=str, default=None,
-                       help='Path to COCO dataset root (if None, uses synthetic)')
-    parser.add_argument('--train-split', type=str, default='train',
-                       help='COCO split to use for training (train or val)')
-    parser.add_argument('--synthetic-size', type=int, default=2000,
-                       help='Number of synthetic training samples')
-    parser.add_argument('--allow-synthetic', action='store_true',
-                       help='Allow fallback to synthetic data when COCO files are incomplete')
+    parser.add_argument("--dataset", default="voc", choices=["voc", "coco", "coco-minitrain"])
+    parser.add_argument("--data-root", default="./VOCdevkit")
+    parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument("--workers", type=int, default=4)
 
     # Model
-    parser.add_argument('--num-classes', type=int, default=80)
-    parser.add_argument('--fpn-channels', type=int, default=128)
-    parser.add_argument('--img-size', type=int, default=640)
+    parser.add_argument("--backbone", default="builtin",
+                        help="'builtin' or a timm model name, e.g. cspdarknet53, convnext_tiny")
+    parser.add_argument("--size", default="s", choices=["n", "s", "m", "l"])
+    parser.add_argument("--no-pretrained", action="store_true")
+    parser.add_argument("--no-attention", action="store_true",
+                        help="disable the P5 attention block")
+    parser.add_argument("--secure-features", action="store_true",
+                        help="enable the random projection layer (reduces mAP)")
+    parser.add_argument("--reg-max", type=int, default=16)
 
-    # Training
-    parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--batch-size', type=int, default=16)
-    parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--weight-decay', type=float, default=5e-4)
-    parser.add_argument('--warmup-epochs', type=int, default=3)
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--workers', type=int, default=4,
-                       help='Number of dataloader workers (increase to prevent GPU starvation)')
-    parser.add_argument('--prefetch-factor', type=int, default=4,
-                       help='Dataloader prefetch factor per worker')
-    parser.add_argument('--seed', type=int, default=42,
-                       help='Random seed for reproducibility')
-    parser.add_argument('--channels-last', action='store_true', default=True,
-                       help='Use channels_last memory format on CUDA for higher throughput')
-    parser.add_argument('--allow-tf32', action='store_true', default=True,
-                       help='Enable TF32 matmul/convolution on CUDA (faster, negligible accuracy impact)')
+    # Optimization
+    parser.add_argument("--epochs", type=int, default=60)
+    parser.add_argument("--batch", type=int, default=8)
+    parser.add_argument("--accumulate", type=int, default=8,
+                        help="gradient accumulation steps; effective batch = batch * accumulate")
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr-final-ratio", type=float, default=0.01)
+    parser.add_argument("--warmup-epochs", type=float, default=3.0)
+    parser.add_argument("--weight-decay", type=float, default=5e-4)
+    parser.add_argument("--optimizer", default="auto", choices=["auto", "adamw", "sgd"])
+    parser.add_argument("--amp", default="bf16", choices=["bf16", "fp16", "off"])
+    parser.add_argument("--no-ema", action="store_true")
 
-    # Adversarial
-    parser.add_argument('--adversarial', action='store_true', default=True,
-                       help='Enable adversarial training')
-    parser.add_argument('--no-adversarial', dest='adversarial', action='store_false')
-    parser.add_argument('--pgd-epsilon', type=float, default=2/255)
-    parser.add_argument('--pgd-alpha', type=float, default=0.5/255)
-    parser.add_argument('--pgd-steps', type=int, default=1)
-    parser.add_argument('--adversarial-ratio', type=float, default=0.2)
-    parser.add_argument('--adversarial-finetune-ratio', type=float, default=0.2,
-                       help='Fraction of final epochs where adversarial batches are enabled')
-    parser.add_argument('--grad-reg-weight', type=float, default=0.0)
-    parser.add_argument('--label-smoothing', type=float, default=0.1)
+    # Augmentation
+    parser.add_argument("--mosaic", type=float, default=1.0)
+    parser.add_argument("--mixup", type=float, default=0.1)
+    parser.add_argument("--close-mosaic", type=int, default=10,
+                        help="disable mosaic for the final N epochs")
 
-    # Logging/Saving
-    parser.add_argument('--save-dir', type=str, default='checkpoints')
-    parser.add_argument('--save-interval', type=int, default=20)
-    parser.add_argument('--val-interval', type=int, default=10)
-    parser.add_argument('--log-interval', type=int, default=20)
+    # Run control
+    parser.add_argument("--name", default="exp")
+    parser.add_argument("--project", default="runs")
+    parser.add_argument("--resume", default="", help="path to a checkpoint")
+    parser.add_argument("--eval-interval", type=int, default=5)
+    parser.add_argument("--save-interval", type=int, default=10)
+    parser.add_argument("--log-interval", type=int, default=50)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--time-budget", type=float, default=0.0,
+                        help="stop cleanly after N hours (0 = unlimited)")
 
-    # Resume
-    parser.add_argument('--resume', type=str, default=None,
-                       help='Path to checkpoint to resume from')
+    args = parser.parse_args()
+    set_seed(args.seed)
 
-    return parser.parse_args()
+    device = torch.device(
+        ("cuda" if torch.cuda.is_available() else "cpu")
+        if args.device == "auto" else args.device
+    )
+
+    run_dir = Path(args.project) / args.name
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    amp_dtype = None
+    scaler = None
+    if args.amp != "off" and device.type == "cuda":
+        if args.amp == "bf16" and torch.cuda.is_bf16_supported():
+            amp_dtype = torch.bfloat16
+        else:
+            amp_dtype = torch.float16
+            scaler = torch.amp.GradScaler("cuda")
+
+    logger.info("Device %s | AMP %s | run dir %s", device,
+                amp_dtype if amp_dtype else "off", run_dir)
+
+    # ── Data ──────────────────────────────────────────────────────────
+    bundle = build_dataloaders(
+        dataset=args.dataset, data_root=args.data_root, img_size=args.imgsz,
+        batch_size=args.batch, workers=args.workers, augment=True,
+        mosaic_prob=args.mosaic, mixup_prob=args.mixup, seed=args.seed,
+    )
+    train_loader = bundle["train_loader"]
+    val_loader = bundle["val_loader"]
+    num_classes = bundle["num_classes"]
+    class_names = bundle["class_names"]
+
+    # ── Model ─────────────────────────────────────────────────────────
+    model = SecureYOLO(
+        num_classes=num_classes, backbone=args.backbone,
+        pretrained=not args.no_pretrained, size=args.size,
+        reg_max=args.reg_max, attention=not args.no_attention,
+        secure_features=args.secure_features,
+    ).to(device)
+    logger.info(model.summary())
+
+    loss_fn = DetectionLoss(num_classes=num_classes, reg_max=args.reg_max).to(device)
+    optimizer = build_optimizer(model, args.optimizer, lr=args.lr,
+                                weight_decay=args.weight_decay)
+    ema = None if args.no_ema else ModelEMA(model)
+
+    start_epoch, best_map = 0, 0.0
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        if ema and ckpt.get("ema"):
+            ema.ema.load_state_dict(ckpt["ema"])
+            ema.updates = ckpt.get("ema_updates", 0)
+        optimizer.load_state_dict(ckpt["optimizer"])
+        start_epoch = ckpt["epoch"] + 1
+        best_map = ckpt.get("best_map", 0.0)
+        logger.info("Resumed from %s at epoch %d (best mAP %.4f)",
+                    args.resume, start_epoch, best_map)
+
+    effective_batch = args.batch * args.accumulate
+    logger.info("Batch %d x accumulate %d = effective batch %d | %d train batches/epoch",
+                args.batch, args.accumulate, effective_batch, len(train_loader))
+
+    with open(run_dir / "config.json", "w", encoding="utf-8") as f:
+        json.dump({**vars(args), "num_classes": num_classes,
+                   "class_names": class_names}, f, indent=2)
+
+    csv_path = run_dir / "results.csv"
+    if not csv_path.exists():
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(
+                ["epoch", "lr", "loss", "box", "cls", "dfl",
+                 "mAP50-95", "mAP50", "mAP75", "epoch_seconds"])
+
+    # ── Training ──────────────────────────────────────────────────────
+    mosaic_closed = False
+    train_start = time.perf_counter()
+    stop_reason = "completed"
+
+    for epoch in range(start_epoch, args.epochs):
+        if (not mosaic_closed and args.close_mosaic > 0
+                and epoch >= args.epochs - args.close_mosaic):
+            logger.info("Closing mosaic/mixup for the final %d epochs", args.close_mosaic)
+            bundle["train_dataset"].close_mosaic()
+            mosaic_closed = True
+
+        lr_scale = cosine_schedule(epoch, args.epochs, args.lr_final_ratio,
+                                   args.warmup_epochs)
+        current_lr = args.lr * lr_scale
+        for group in optimizer.param_groups:
+            group["lr"] = current_lr
+
+        logger.info("Epoch %d/%d | lr %.2e", epoch + 1, args.epochs, current_lr)
+        losses, elapsed = train_one_epoch(
+            model, train_loader, loss_fn, optimizer, scaler, device, epoch + 1,
+            args, ema=ema, amp_dtype=amp_dtype, accumulate=args.accumulate,
+        )
+        logger.info("Epoch %d done in %.1fs | loss %.4f (box %.3f cls %.3f dfl %.3f)",
+                    epoch + 1, elapsed, losses["total"], losses["box"],
+                    losses["cls"], losses["dfl"])
+
+        metrics = None
+        is_last = (epoch + 1) == args.epochs
+        if args.eval_interval and ((epoch + 1) % args.eval_interval == 0 or is_last):
+            eval_model = ema.ema if ema else model
+            metrics = evaluate(
+                eval_model, val_loader, bundle["gt_json"], bundle["id_map"],
+                device, class_names=class_names, amp_dtype=amp_dtype,
+            )
+            logger.info("\n%s", format_metrics(metrics, f"Epoch {epoch + 1} validation"))
+
+            if metrics["mAP50-95"] > best_map:
+                best_map = metrics["mAP50-95"]
+                save_checkpoint(run_dir / "best.pt", model, ema, optimizer,
+                                epoch, best_map, args, class_names)
+                logger.info("New best mAP@[.5:.95] %.4f -> best.pt", best_map)
+
+        with open(csv_path, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([
+                epoch + 1, f"{current_lr:.6f}", f"{losses['total']:.4f}",
+                f"{losses['box']:.4f}", f"{losses['cls']:.4f}", f"{losses['dfl']:.4f}",
+                f"{metrics['mAP50-95']:.4f}" if metrics else "",
+                f"{metrics['mAP50']:.4f}" if metrics else "",
+                f"{metrics['mAP75']:.4f}" if metrics else "",
+                f"{elapsed:.1f}",
+            ])
+
+        save_checkpoint(run_dir / "last.pt", model, ema, optimizer, epoch,
+                        best_map, args, class_names)
+        if args.save_interval and (epoch + 1) % args.save_interval == 0:
+            save_checkpoint(run_dir / f"epoch_{epoch + 1}.pt", model, ema,
+                            optimizer, epoch, best_map, args, class_names)
+
+        if args.time_budget > 0:
+            hours = (time.perf_counter() - train_start) / 3600
+            if hours >= args.time_budget:
+                logger.warning("Time budget of %.2f h reached at epoch %d; stopping.",
+                               args.time_budget, epoch + 1)
+                stop_reason = "time_budget"
+                break
+
+    total_hours = (time.perf_counter() - train_start) / 3600
+    logger.info("Training %s after %.2f h | best mAP@[.5:.95] %.4f",
+                stop_reason, total_hours, best_map)
+
+    # ── Final evaluation with per-class breakdown ──────────────────────
+    best_path = run_dir / "best.pt"
+    if best_path.exists():
+        ckpt = torch.load(best_path, map_location=device, weights_only=False)
+        eval_model = SecureYOLO(
+            num_classes=num_classes, backbone=args.backbone, pretrained=False,
+            size=args.size, reg_max=args.reg_max,
+            attention=not args.no_attention, secure_features=args.secure_features,
+        ).to(device)
+        eval_model.load_state_dict(ckpt["ema"] if ckpt.get("ema") else ckpt["model"])
+
+        metrics = evaluate(
+            eval_model, val_loader, bundle["gt_json"], bundle["id_map"], device,
+            class_names=class_names, amp_dtype=amp_dtype, per_class=True,
+            save_json=str(run_dir / "predictions.json"),
+        )
+        logger.info("\n%s", format_metrics(metrics, "FINAL (best checkpoint, EMA)"))
+
+        metrics["training_hours"] = total_hours
+        metrics["stop_reason"] = stop_reason
+        with open(run_dir / "final_metrics.json", "w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2)
+        logger.info("Wrote %s", run_dir / "final_metrics.json")
+
+    return 0
 
 
 if __name__ == "__main__":
-    args = parse_args()
-
-    train(args)
+    sys.exit(main())

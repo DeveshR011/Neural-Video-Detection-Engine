@@ -60,9 +60,19 @@ class BboxLoss(nn.Module):
 
     @staticmethod
     def _df_loss(pred_dist, target):
-        """Cross-entropy against the two integer bins bracketing the target."""
+        """Cross-entropy against the two integer bins bracketing the target.
+
+        The bin range is enforced here, in float32, rather than relying on the
+        clamp inside ``bbox2dist``. Under bfloat16 autocast the mantissa is
+        only 8 bits, so a value clamped to ``reg_max - 1.01`` (14.99 for 16
+        bins) rounds to exactly 15.0 and the upper index ``tr`` overflows to
+        16 -- a device-side assert rather than a wrong number, but only under
+        AMP and only for boxes near the maximum distance.
+        """
+        n_bins = pred_dist.shape[1]
+        target = target.float().clamp_(0, n_bins - 1 - 1e-3)
         tl = target.long()
-        tr = tl + 1
+        tr = (tl + 1).clamp_(max=n_bins - 1)
         wl = tr.to(target.dtype) - target
         wr = 1 - wl
         return (
