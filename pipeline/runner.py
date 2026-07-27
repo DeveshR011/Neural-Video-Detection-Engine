@@ -107,9 +107,9 @@ class SecurePipelineRunner:
                     with torch.no_grad():
                         if self.use_amp:
                             with torch.amp.autocast('cuda'):
-                                return self.model.predict(t_frame)
+                                return self.model.predict_padded(t_frame)
                         else:
-                            return self.model.predict(t_frame)
+                            return self.model.predict_padded(t_frame)
 
                 if self.timing_injector:
                     raw_predictions = self.timing_injector.wrap_inference(_infer)

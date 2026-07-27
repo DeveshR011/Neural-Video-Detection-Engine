@@ -97,7 +97,7 @@ class BenchmarkSuite:
         for _ in range(10):
             dummy = torch.randn(1, 3, 640, 640, device=self.device)
             with torch.no_grad():
-                _ = self.model.predict(dummy, conf_threshold=0.35, max_detections=200, pre_nms_topk=800)
+                _ = self.model.predict_padded(dummy, conf_threshold=0.35, max_detections=200, pre_nms_topk=800)
             if self.device.type == "cuda":
                 torch.cuda.synchronize()
 
@@ -107,7 +107,7 @@ class BenchmarkSuite:
                 torch.cuda.synchronize()
             start = time.perf_counter()
             with torch.no_grad():
-                _ = self.model.predict(frame, conf_threshold=0.35, max_detections=200, pre_nms_topk=800)
+                _ = self.model.predict_padded(frame, conf_threshold=0.35, max_detections=200, pre_nms_topk=800)
             if self.device.type == "cuda":
                 torch.cuda.synchronize()
             latencies.append(time.perf_counter() - start)
@@ -137,7 +137,7 @@ class BenchmarkSuite:
             torch.cuda.reset_peak_memory_stats()
             before = torch.cuda.memory_allocated()
             with torch.no_grad():
-                _ = self.model.predict(frame)
+                _ = self.model.predict_padded(frame)
             peak = torch.cuda.max_memory_allocated()
             act_bytes = peak - before
         else:
@@ -163,7 +163,7 @@ class BenchmarkSuite:
         for _ in range(8):
             frame = torch.rand(1, 3, 640, 640, device=self.device)
             with torch.no_grad():
-                pred = self.model.predict(frame)
+                pred = self.model.predict_padded(frame)
             smoothed = smoother.smooth(pred)
 
             if prev_raw is not None:
@@ -199,7 +199,7 @@ class BenchmarkSuite:
             morpher.morph(model_copy)
             model_copy.eval()
             with torch.no_grad():
-                out = model_copy.predict(test_frame)
+                out = model_copy.predict_padded(test_frame)
             outputs.append(out.cpu())
             del model_copy
 
@@ -244,7 +244,7 @@ class BenchmarkSuite:
                 torch.cuda.synchronize()
             start = time.perf_counter()
             with torch.no_grad():
-                _ = self.model.predict(frame, conf_threshold=0.35, max_detections=200, pre_nms_topk=800)
+                _ = self.model.predict_padded(frame, conf_threshold=0.35, max_detections=200, pre_nms_topk=800)
             if self.device.type == "cuda":
                 torch.cuda.synchronize()
             raw_lats.append(time.perf_counter() - start)
@@ -257,7 +257,7 @@ class BenchmarkSuite:
             start = time.perf_counter()
             frame = AdversarialRobustness.preprocess_frame(frame, allow_cpu_transforms=False)
             with torch.no_grad():
-                _ = self.model.predict(frame, conf_threshold=0.35, max_detections=200, pre_nms_topk=800)
+                _ = self.model.predict_padded(frame, conf_threshold=0.35, max_detections=200, pre_nms_topk=800)
             if self.device.type == "cuda":
                 torch.cuda.synchronize()
             secure_lats.append(time.perf_counter() - start)
@@ -271,7 +271,7 @@ class BenchmarkSuite:
             start = time.perf_counter()
             frame = AdversarialRobustness.preprocess_frame(frame, allow_cpu_transforms=False)
             with torch.no_grad():
-                pred = self.model.predict(frame, conf_threshold=0.35, max_detections=200, pre_nms_topk=800)
+                pred = self.model.predict_padded(frame, conf_threshold=0.35, max_detections=200, pre_nms_topk=800)
             _ = smoother.smooth(pred)
             if self.device.type == "cuda":
                 torch.cuda.synchronize()
@@ -402,7 +402,7 @@ class BenchmarkSuite:
                 inp = perturb(inp)
 
             with torch.no_grad():
-                pred = self.model.predict(inp)[0].detach().cpu().numpy()
+                pred = self.model.predict_padded(inp)[0].detach().cpu().numpy()
 
             conf = pred[:, 4]
             cls = np.argmax(pred[:, 5:], axis=1)

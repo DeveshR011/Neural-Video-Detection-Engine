@@ -23,9 +23,11 @@ def main():
 
 	x = torch.rand(1, 3, 640, 640, device=device)
 	with torch.no_grad():
-		raw = model(x)
-		pred = model.predict(x)
-	print(f"raw_shape={tuple(raw.shape)}")
+		box_dist, cls_logits, anchor_points, strides = model(x)
+		pred = model.predict_padded(x)
+	print(f"box_dist_shape={tuple(box_dist.shape)}")
+	print(f"cls_logits_shape={tuple(cls_logits.shape)}")
+	print(f"anchors={anchor_points.shape[0]}")
 	print(f"pred_shape={tuple(pred.shape)}")
 
 	wk = os.urandom(32)

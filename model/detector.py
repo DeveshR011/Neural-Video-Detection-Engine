@@ -205,6 +205,37 @@ class SecureYOLO(nn.Module):
         return results
 
     @torch.no_grad()
+    def predict_padded(self, images, max_detections: int = 300, **kwargs):
+        """Inference returning a dense ``[B, max_detections, 5 + nc]`` tensor.
+
+        Layout per row: ``(cx, cy, w, h, score, one-hot class)`` with boxes
+        normalized to [0, 1]. Rows beyond the detection count are zero.
+
+        ``predict`` returns a ragged list, which is the correct representation
+        for evaluation and for callers that iterate detections. The temporal
+        smoother and the benchmark suite instead expect a fixed-size tensor
+        they can index and stack, so that shape is produced explicitly here
+        rather than by making ``predict`` ambiguous.
+        """
+        results = self.predict(images, max_detections=max_detections, **kwargs)
+        height, width = images.shape[-2:]
+
+        out = images.new_zeros((len(results), max_detections, 5 + self.num_classes))
+        for bi, det in enumerate(results):
+            n = min(det.shape[0], max_detections)
+            if n == 0:
+                continue
+            box = det[:n, :4]
+            out[bi, :n, 0] = (box[:, 0] + box[:, 2]) / 2 / width
+            out[bi, :n, 1] = (box[:, 1] + box[:, 3]) / 2 / height
+            out[bi, :n, 2] = (box[:, 2] - box[:, 0]) / width
+            out[bi, :n, 3] = (box[:, 3] - box[:, 1]) / height
+            out[bi, :n, 4] = det[:n, 4]
+            out[bi, torch.arange(n, device=out.device),
+                5 + det[:n, 5].long()] = 1.0
+        return out
+
+    @torch.no_grad()
     def secure_forward(self, frame_tensor, **kwargs):
         """Inference entry point that clears the caller's input buffer afterwards.
 
