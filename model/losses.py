@@ -1,8 +1,10 @@
 """
-Detection Training Losses
-===========================
-CIoU, Focal, Varifocal, and Temporal Jitter losses for
-high-accuracy object detection training.
+Generic Loss Components
+=======================
+IoU-family box metrics and classification losses shared across the codebase.
+
+The combined detection objective lives in ``model/detection_loss.py``; this
+module holds only reusable pieces.
 """
 
 import torch
@@ -12,37 +14,58 @@ import math
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  IoU Family Losses (Box Regression)
+#  IoU Family (Box Regression)
 # ══════════════════════════════════════════════════════════════════════
 
-def bbox_iou(box1, box2, xywh=True, eps=1e-7):
-    """Compute IoU between two sets of boxes. Returns IoU tensor."""
+def bbox_iou(box1, box2, xywh=True, giou=False, diou=False, ciou=False, eps=1e-7):
+    """IoU and its distance-aware variants between broadcastable box tensors.
+
+    Args:
+        box1, box2: [..., 4] boxes, xywh if ``xywh`` else xyxy
+        giou/diou/ciou: select a variant; plain IoU when all are False
+
+    Returns:
+        Tensor of shape [...] with the requested overlap measure.
+    """
     if xywh:
-        # Convert xywh → xyxy
-        b1_x1 = box1[..., 0] - box1[..., 2] / 2
-        b1_y1 = box1[..., 1] - box1[..., 3] / 2
-        b1_x2 = box1[..., 0] + box1[..., 2] / 2
-        b1_y2 = box1[..., 1] + box1[..., 3] / 2
-        b2_x1 = box2[..., 0] - box2[..., 2] / 2
-        b2_y1 = box2[..., 1] - box2[..., 3] / 2
-        b2_x2 = box2[..., 0] + box2[..., 2] / 2
-        b2_y2 = box2[..., 1] + box2[..., 3] / 2
+        (x1, y1, w1, h1), (x2, y2, w2, h2) = box1.chunk(4, -1), box2.chunk(4, -1)
+        w1_, h1_, w2_, h2_ = w1 / 2, h1 / 2, w2 / 2, h2 / 2
+        b1_x1, b1_x2, b1_y1, b1_y2 = x1 - w1_, x1 + w1_, y1 - h1_, y1 + h1_
+        b2_x1, b2_x2, b2_y1, b2_y2 = x2 - w2_, x2 + w2_, y2 - h2_, y2 + h2_
     else:
-        b1_x1, b1_y1, b1_x2, b1_y2 = box1.unbind(-1)
-        b2_x1, b2_y1, b2_x2, b2_y2 = box2.unbind(-1)
+        b1_x1, b1_y1, b1_x2, b1_y2 = box1.chunk(4, -1)
+        b2_x1, b2_y1, b2_x2, b2_y2 = box2.chunk(4, -1)
+        w1, h1 = b1_x2 - b1_x1, (b1_y2 - b1_y1).clamp(eps)
+        w2, h2 = b2_x2 - b2_x1, (b2_y2 - b2_y1).clamp(eps)
 
-    inter_x1 = torch.max(b1_x1, b2_x1)
-    inter_y1 = torch.max(b1_y1, b2_y1)
-    inter_x2 = torch.min(b1_x2, b2_x2)
-    inter_y2 = torch.min(b1_y2, b2_y2)
-    inter = (inter_x2 - inter_x1).clamp(0) * (inter_y2 - inter_y1).clamp(0)
-
-    area1 = (b1_x2 - b1_x1) * (b1_y2 - b1_y1)
-    area2 = (b2_x2 - b2_x1) * (b2_y2 - b2_y1)
-    union = area1 + area2 - inter + eps
-
+    inter = (b1_x2.minimum(b2_x2) - b1_x1.maximum(b2_x1)).clamp_(0) * \
+            (b1_y2.minimum(b2_y2) - b1_y1.maximum(b2_y1)).clamp_(0)
+    union = w1 * h1 + w2 * h2 - inter + eps
     iou = inter / union
-    return iou
+
+    if not (giou or diou or ciou):
+        return iou.squeeze(-1)
+
+    cw = b1_x2.maximum(b2_x2) - b1_x1.minimum(b2_x1)
+    ch = b1_y2.maximum(b2_y2) - b1_y1.minimum(b2_y1)
+
+    if ciou or diou:
+        c2 = cw.pow(2) + ch.pow(2) + eps
+        rho2 = ((b2_x1 + b2_x2 - b1_x1 - b1_x2).pow(2) +
+                (b2_y1 + b2_y2 - b1_y1 - b1_y2).pow(2)) / 4
+        if ciou:
+            v = (4 / math.pi ** 2) * (
+                (w2 / h2).atan() - (w1 / h1.clamp(eps)).atan()
+            ).pow(2)
+            # alpha is a non-gradient trade-off factor; detaching it keeps the
+            # aspect-ratio term from destabilizing early training.
+            with torch.no_grad():
+                alpha = v / (v - iou + (1 + eps))
+            return (iou - (rho2 / c2 + v * alpha)).squeeze(-1)
+        return (iou - rho2 / c2).squeeze(-1)
+
+    c_area = cw * ch + eps
+    return (iou - (c_area - union) / c_area).squeeze(-1)
 
 
 class CIoULoss(nn.Module):
@@ -210,206 +233,3 @@ class TemporalJitterLoss(nn.Module):
 
         jitter = F.mse_loss(current_boxes, previous_boxes)
         return self.weight * jitter
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  Combined Detection Loss
-# ══════════════════════════════════════════════════════════════════════
-
-class DetectionLoss(nn.Module):
-    """Combined loss for detection training:
-    L_total = λ_box * CIoU + λ_cls * Focal + λ_obj * BCE + λ_jitter * Temporal
-
-    Handles mismatch between prediction grid (N anchors) and sparse GT
-    targets (M objects) via IoU-based assignment: each prediction is
-    assigned to its best-matching GT, or treated as negative."""
-
-    def __init__(self, num_classes=80, lambda_box=5.0, lambda_cls=1.0,
-                 lambda_obj=1.0, lambda_jitter=0.1, iou_assign_thresh=0.5):
-        super().__init__()
-        self.num_classes = num_classes
-        self.lambda_box = lambda_box
-        self.lambda_cls = lambda_cls
-        self.lambda_obj = lambda_obj
-        self.lambda_jitter = lambda_jitter
-        self.iou_assign_thresh = iou_assign_thresh
-        self.anchors = (
-            ((10.0, 13.0), (16.0, 30.0), (33.0, 23.0)),
-            ((30.0, 61.0), (62.0, 45.0), (59.0, 119.0)),
-            ((116.0, 90.0), (156.0, 198.0), (373.0, 326.0)),
-        )
-        self.strides = (8.0, 16.0, 32.0)
-
-        self.box_loss = CIoULoss()
-        self.cls_loss = FocalLoss(alpha=0.25, gamma=2.0)
-        self.obj_loss = nn.BCEWithLogitsLoss()
-        self.jitter_loss = TemporalJitterLoss(weight=lambda_jitter)
-
-    def _decode_flat_boxes(self, pred_boxes_raw: torch.Tensor) -> torch.Tensor:
-        """Decode raw [N,4] YOLO box predictions into normalized xywh for matching/regression."""
-        n_pred = pred_boxes_raw.shape[0]
-        device = pred_boxes_raw.device
-        dtype = pred_boxes_raw.dtype
-
-        if n_pred % 3 != 0:
-            xy = torch.sigmoid(pred_boxes_raw[:, :2])
-            wh = torch.sigmoid(pred_boxes_raw[:, 2:4])
-            return torch.cat([xy, wh], dim=-1)
-
-        cells_total = n_pred // 3
-        base = int(round((cells_total * 16.0 / 21.0) ** 0.5))
-        h1 = max(base, 4)
-        h2 = max(h1 // 2, 2)
-        h3 = max(h1 // 4, 1)
-        w1, w2, w3 = h1, h2, h3
-
-        counts = [3 * h1 * w1, 3 * h2 * w2, 3 * h3 * w3]
-        if sum(counts) != n_pred:
-            xy = torch.sigmoid(pred_boxes_raw[:, :2])
-            wh = torch.sigmoid(pred_boxes_raw[:, 2:4])
-            return torch.cat([xy, wh], dim=-1)
-
-        decoded_scales = []
-        start = 0
-        for scale_idx, (h, w, stride, anchors) in enumerate(zip((h1, h2, h3), (w1, w2, w3), self.strides, self.anchors)):
-            end = start + counts[scale_idx]
-            raw = pred_boxes_raw[start:end].reshape(3, h, w, 4)
-
-            yv, xv = torch.meshgrid(
-                torch.arange(h, device=device),
-                torch.arange(w, device=device),
-                indexing='ij'
-            )
-            grid = torch.stack((xv, yv), dim=-1).to(dtype).view(1, h, w, 2)
-            anchor_t = torch.tensor(anchors, device=device, dtype=dtype).view(3, 1, 1, 2)
-
-            xy = (torch.sigmoid(raw[..., :2]) + grid) * stride
-            wh = torch.exp(raw[..., 2:4]).clamp(max=1e3) * anchor_t
-
-            # Assume square training images with side length stride * feature_size_of_smallest_scale.
-            image_size = float(h1 * self.strides[0])
-            decoded = torch.cat([
-                xy[..., 0:1] / image_size,
-                xy[..., 1:2] / image_size,
-                wh[..., 0:1] / image_size,
-                wh[..., 1:2] / image_size,
-            ], dim=-1).clamp(0.0, 1.0)
-
-            decoded_scales.append(decoded.reshape(-1, 4))
-            start = end
-
-        return torch.cat(decoded_scales, dim=0)
-
-    def _assign_targets(self, pred_boxes, gt_boxes, gt_mask):
-        """
-        Assign each prediction to its best-matching GT object via IoU.
-
-        Args:
-            pred_boxes: [N, 4] predicted boxes (xywh)
-            gt_boxes: [M, 4] ground truth boxes (xywh)
-            gt_mask: [M] objectness mask (1=valid GT, 0=padding)
-
-        Returns:
-            assigned_gt_idx: [N] index of assigned GT (-1 = negative)
-            positive_mask: [N] bool mask of positive predictions
-        """
-        n_pred = pred_boxes.shape[0]
-        n_gt = gt_boxes.shape[0]
-
-        # Find valid GT objects
-        valid = gt_mask > 0.5
-        n_valid = valid.sum().item()
-
-        if n_valid == 0:
-            return (torch.full((n_pred,), -1, device=pred_boxes.device, dtype=torch.long),
-                    torch.zeros(n_pred, device=pred_boxes.device, dtype=torch.bool))
-
-        valid_gt = gt_boxes[valid]  # [K, 4]
-
-        # Compute IoU between all predictions and valid GTs
-        ious = bbox_iou(pred_boxes.unsqueeze(1).expand(-1, n_valid, -1),
-                       valid_gt.unsqueeze(0).expand(n_pred, -1, -1))  # [N, K]
-
-        # Best GT for each prediction
-        best_iou, best_idx = ious.max(dim=1)  # [N], [N]
-
-        # Positive by threshold + force at least one prediction per GT.
-        positive_mask = best_iou > self.iou_assign_thresh
-        best_pred_for_each_gt = ious.argmax(dim=0)
-        positive_mask[best_pred_for_each_gt] = True
-
-        # Map back to original GT indices
-        valid_indices = torch.where(valid)[0]  # [K]
-        assigned_gt_idx = torch.full((n_pred,), -1, device=pred_boxes.device, dtype=torch.long)
-        assigned_gt_idx[positive_mask] = valid_indices[best_idx[positive_mask]]
-
-        # Ensure forced positives are explicitly mapped to their GT.
-        for k, pred_idx in enumerate(best_pred_for_each_gt):
-            assigned_gt_idx[pred_idx] = valid_indices[k]
-
-        return assigned_gt_idx, positive_mask
-
-    def forward(self, predictions, targets, prev_boxes=None):
-        """
-        Args:
-            predictions: [B, N_anchors, 5+C] detection predictions
-            targets: dict with 'boxes' [B, M, 4], 'classes' [B, M, C], 'obj_mask' [B, M]
-        """
-        B = predictions.shape[0]
-        device = predictions.device
-
-        total_box = torch.tensor(0.0, device=device)
-        total_cls = torch.tensor(0.0, device=device)
-        total_obj = torch.tensor(0.0, device=device)
-        n_pos = 0
-
-        for b in range(B):
-            pred_b = predictions[b]  # [N, 5+C]
-            pred_boxes_raw = pred_b[:, :4]
-            pred_boxes = self._decode_flat_boxes(pred_boxes_raw)
-            pred_obj = pred_b[:, 4]
-            pred_cls = pred_b[:, 5:]
-
-            gt_boxes = targets['boxes'][b]      # [M, 4]
-            gt_classes = targets['classes'][b]   # [M, C]
-            gt_mask = targets['obj_mask'][b]     # [M]
-
-            # Assign predictions to GT
-            assigned_idx, pos_mask = self._assign_targets(pred_boxes.detach(), gt_boxes, gt_mask)
-
-            # Objectness target: 1 for positive, 0 for negative
-            obj_target = pos_mask.float()
-            total_obj = total_obj + self.obj_loss(pred_obj, obj_target)
-
-            # Box + class loss only on positives
-            if pos_mask.sum() > 0:
-                pos_pred_boxes = pred_boxes[pos_mask]
-                pos_pred_cls = pred_cls[pos_mask]
-                pos_gt_boxes = gt_boxes[assigned_idx[pos_mask]]
-                pos_gt_cls = gt_classes[assigned_idx[pos_mask]]
-
-                total_box = total_box + self.box_loss(pos_pred_boxes, pos_gt_boxes)
-                total_cls = total_cls + self.cls_loss(pos_pred_cls, pos_gt_cls)
-                n_pos += pos_mask.sum().item()
-
-        # Average over batch
-        total_obj = total_obj / B
-        if n_pos > 0:
-            total_box = total_box / B
-            total_cls = total_cls / B
-
-        loss_box = self.lambda_box * total_box
-        loss_cls = self.lambda_cls * total_cls
-        loss_obj = self.lambda_obj * total_obj
-        loss_jitter = self.jitter_loss(predictions[..., :4], prev_boxes)
-
-        total = loss_box + loss_cls + loss_obj + loss_jitter
-
-        return {
-            'total': total,
-            'box': loss_box.item(),
-            'cls': loss_cls.item(),
-            'obj': loss_obj.item(),
-            'jitter': loss_jitter.item(),
-            'n_positives': n_pos,
-        }
