@@ -325,8 +325,33 @@ def main():
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch = ckpt["epoch"] + 1
         best_map = ckpt.get("best_map", 0.0)
-        logger.info("Resumed from %s at epoch %d (best mAP %.4f)",
-                    args.resume, start_epoch, best_map)
+
+        # A run split across sessions must keep the same schedule. `epochs`
+        # defines the cosine curve and `lr` its amplitude, so a different
+        # value on resume silently changes the learning-rate trajectory for
+        # the remaining epochs. Architecture flags must match too, or the
+        # restored state dict describes a different network.
+        saved = ckpt.get("args", {})
+        critical = ["epochs", "lr", "lr_final_ratio", "warmup_epochs",
+                    "backbone", "size", "reg_max", "imgsz", "batch",
+                    "accumulate", "close_mosaic", "no_attention",
+                    "secure_features", "dataset"]
+        mismatched = {
+            k: (saved[k], getattr(args, k))
+            for k in critical
+            if k in saved and getattr(args, k, None) != saved[k]
+        }
+        if mismatched:
+            logger.error("Resume flags differ from the original run:")
+            for k, (was, now) in mismatched.items():
+                logger.error("  --%-16s original=%r  now=%r",
+                             k.replace("_", "-"), was, now)
+            raise SystemExit(
+                "Refusing to resume with a changed configuration. Re-run with "
+                "the original flags, or start a fresh run under a new --name.")
+
+        logger.info("Resumed from %s at epoch %d/%d (best mAP %.4f)",
+                    args.resume, start_epoch, args.epochs, best_map)
 
     effective_batch = args.batch * args.accumulate
     logger.info("Batch %d x accumulate %d = effective batch %d | %d train batches/epoch",

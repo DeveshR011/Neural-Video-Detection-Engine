@@ -108,18 +108,42 @@ versus off.
 
 ## Benchmark plan
 
-**Phase 1 — PASCAL VOC 07+12** (16.5k train, 20 classes). Validates the
-rewritten loss and assigner with a fast feedback loop. Target: 80–85 mAP@0.5,
-comparable to YOLOv3 (80.3), SSD512 (79.8), Faster R-CNN (73.2). Expected
-wall-clock: 4–8 hours.
+**PASCAL VOC 07+12 only.** Train on VOC2007 trainval + VOC2012 trainval
+(16,551 images), evaluate on VOC2007 test (4,952 images) — the protocol used
+by the published baselines. COCO was dropped: the 19 GB download plus ~10 h of
+training did not fit the wall-clock budget, and a single well-executed
+benchmark is worth more than two rushed ones.
 
-**Phase 2 — COCO minitrain (25k subset)**, evaluated on full val2017. Target:
-28–33 mAP@[.5:.95]. Expected wall-clock: 10–20 hours.
+Measured throughput: 31.4 img/s at 640px, batch 16, bf16 on the RTX 4050
+(4.4 GB of 6.4 GB used) — 8.8 minutes per epoch.
 
-**Reporting honesty.** Published YOLOv8 numbers use 118k images for ~500
-epochs. Our COCO result must be reported as "X mAP trained on COCO minitrain
-(25k images) in N GPU-hours on a single RTX 4050", never compared bare against
-full-COCO results.
+Run is split across two sessions using `--resume`, which restores model, EMA,
+optimizer state, epoch counter, and best-mAP. The cosine schedule is computed
+from the total epoch count, so splitting does not distort it. Resume refuses
+to start if any schedule- or architecture-critical flag differs from the
+original run.
+
+**Comparison set.** Our protocol is an ImageNet-pretrained backbone with the
+detector trained from random init, so the honest comparison is against:
+
+| Model | VOC07 test mAP@0.5 |
+|---|---|
+| Faster R-CNN (VGG16) | 73.2 |
+| SSD512 | 79.8 |
+| YOLOv3 | ~80.3 |
+| R-FCN (ResNet-101) | 80.5 |
+| RefineDet512 | 81.8 |
+
+**Reporting honesty.**
+
+- Results in the 88–92 range reported for YOLOv5/v8 on VOC start from a
+  *COCO-pretrained detector* and fine-tune. That transfers detection knowledge
+  from 118k images and 80 classes. Our number must never be compared against
+  those without stating the difference in protocol.
+- We report COCO-style AP50 via pycocotools on VOC data. The official VOC
+  metric uses different interpolation; the two typically agree within ~1
+  point but are not identical. The README must say so.
+- The headline claim states dataset, epochs, hardware, and wall-clock.
 
 ## Testing
 
