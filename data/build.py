@@ -143,6 +143,15 @@ def build_dataloaders(dataset="voc", data_root="./VOCdevkit", img_size=640,
     generator.manual_seed(seed)
 
     pin = torch.cuda.is_available()
+
+    # Validation workers are not kept alive between epochs. Holding a second
+    # persistent pool doubles the resident worker processes for the whole run,
+    # and on Windows each one reserves shared memory against the paging file.
+    # Exhausting that limit surfaces as "Couldn't open shared file mapping ...
+    # error code 1455" mid-epoch, after hours of training. The val loader is
+    # used once every eval_interval epochs, so respawning it is cheap.
+    val_workers = min(workers, 2)
+
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
         num_workers=workers, pin_memory=pin, drop_last=True,
@@ -151,9 +160,9 @@ def build_dataloaders(dataset="voc", data_root="./VOCdevkit", img_size=640,
     )
     val_loader = DataLoader(
         val_dataset, batch_size=val_batch_size or batch_size, shuffle=False,
-        num_workers=workers, pin_memory=pin, drop_last=False,
+        num_workers=val_workers, pin_memory=pin, drop_last=False,
         collate_fn=ValDetectionDataset.collate_fn,
-        persistent_workers=workers > 0,
+        persistent_workers=False,
     )
 
     gt_json = cache_gt_json or os.path.join("runs", "cache", f"{dataset}_val_gt.json")

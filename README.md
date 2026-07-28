@@ -261,6 +261,11 @@ scripts/             dataset downloaders
   run was performed; the 19 GB download plus ~10 h of training did not fit the
   compute budget.
 - Enclave backends are stubs (see above).
+- **Windows DataLoader memory.** Each worker reserves shared memory against the
+  paging file. Too many resident workers exhausts it and fails mid-epoch with
+  `Couldn't open shared file mapping ... error code 1455`, often hours in. The
+  val loader therefore uses at most 2 non-persistent workers. If it still
+  occurs, lower `--workers` or raise the Windows paging file size.
 
 ### What would raise the number
 
