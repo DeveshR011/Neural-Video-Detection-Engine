@@ -95,7 +95,11 @@ class DetectHead(nn.Module):
         self.num_outputs = num_classes + 4 * reg_max
 
         reg_hidden = hidden or max(16, in_channels[0] // 4, reg_max * 4)
-        cls_hidden = hidden or max(in_channels[0], num_classes)
+        # Head width must not depend on the class count. If it did, models
+        # trained on different label sets would have structurally different
+        # heads and weights could not be transferred between them -- which is
+        # exactly what COCO-pretraining then fine-tuning on VOC requires.
+        cls_hidden = hidden or max(in_channels[0], 64)
 
         self.reg_branches = nn.ModuleList(
             nn.Sequential(

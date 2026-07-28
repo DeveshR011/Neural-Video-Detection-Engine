@@ -392,3 +392,96 @@ def test_amp_bf16_training_step():
 
     assert torch.isfinite(loss), "bf16 step produced a non-finite loss"
     assert comp["n_positives"] > 0
+
+
+# ── Cross-dataset transfer ────────────────────────────────────────────
+
+COCO_CLASSES = [
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
+    "truck", "boat", "traffic light", "fire hydrant", "stop sign",
+    "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+    "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag",
+    "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball", "kite",
+    "baseball bat", "baseball glove", "skateboard", "surfboard",
+    "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon",
+    "bowl", "banana", "apple", "sandwich", "orange", "broccoli", "carrot",
+    "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant",
+    "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote",
+    "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
+    "refrigerator", "book", "clock", "vase", "scissors", "teddy bear",
+    "hair drier", "toothbrush",
+]
+
+
+def test_every_voc_class_maps_to_coco():
+    """All 20 VOC classes exist in COCO, so none should fall back to random init."""
+    from data.dataset import VOC_CLASSES
+    from model.transfer import VOC_TO_COCO, build_class_index_map
+
+    _, matched, unmatched = build_class_index_map(
+        COCO_CLASSES, list(VOC_CLASSES), VOC_TO_COCO)
+    assert not unmatched, f"unmapped VOC classes: {unmatched}"
+    assert len(matched) == 20
+
+
+def test_voc_coco_alias_targets_are_real_coco_classes():
+    """Guards against typos in the alias table, which would silently drop a class."""
+    from model.transfer import VOC_TO_COCO
+    for voc_name, coco_name in VOC_TO_COCO.items():
+        assert coco_name in COCO_CLASSES, \
+            f"alias {voc_name} -> {coco_name!r} is not a COCO class"
+
+
+@pytest.mark.parametrize("size", ["n", "s"])
+def test_head_width_independent_of_class_count(size):
+    """Head geometry must not depend on num_classes.
+
+    If it did, an 80-class and a 20-class model would have structurally
+    different heads and no weights could transfer between them.
+    """
+    a = SecureYOLO(num_classes=80, size=size)
+    b = SecureYOLO(num_classes=20, size=size)
+    for branch_a, branch_b in zip(a.head.cls_branches, b.head.cls_branches):
+        # All layers except the final per-class conv must match exactly.
+        assert branch_a[0].conv.weight.shape == branch_b[0].conv.weight.shape
+        assert branch_a[1].conv.weight.shape == branch_b[1].conv.weight.shape
+
+
+@pytest.mark.parametrize("size", ["n", "s"])
+def test_transfer_copies_all_tensors_and_slices_classes(size):
+    """A COCO -> VOC transfer must leave nothing randomly initialized."""
+    from data.dataset import VOC_CLASSES
+    from model.transfer import build_class_index_map, transfer_state_dict, VOC_TO_COCO
+
+    src = SecureYOLO(num_classes=80, size=size)
+    dst = SecureYOLO(num_classes=20, size=size)
+    new_state, report = transfer_state_dict(
+        src.state_dict(), dst, COCO_CLASSES, list(VOC_CLASSES))
+    dst.load_state_dict(new_state)
+
+    assert report["skipped"] == 0, "some tensors were left at their init values"
+    # weight + bias of the final conv at each of the three levels
+    assert report["sliced"] == 6
+
+    idx, _, _ = build_class_index_map(COCO_CLASSES, list(VOC_CLASSES), VOC_TO_COCO)
+    key = "head.cls_branches.0.2.weight"
+    for dst_i, src_i in enumerate(idx):
+        assert torch.allclose(dst.state_dict()[key][dst_i], src.state_dict()[key][src_i])
+
+    assert torch.allclose(dst.backbone.body.stem.conv.weight,
+                          src.backbone.body.stem.conv.weight)
+
+
+def test_transfer_leaves_unmatched_classes_initialized():
+    """A destination class with no source counterpart keeps its own weights."""
+    from model.transfer import transfer_state_dict
+
+    src = SecureYOLO(num_classes=3, size="n")
+    dst = SecureYOLO(num_classes=3, size="n")
+    original = dst.state_dict()["head.cls_branches.0.2.weight"].clone()
+
+    new_state, report = transfer_state_dict(
+        src.state_dict(), dst, ["cat", "dog", "bird"], ["cat", "dog", "wombat"])
+
+    assert report["unmatched_classes"] == ["wombat"]
+    assert torch.allclose(new_state["head.cls_branches.0.2.weight"][2], original[2])

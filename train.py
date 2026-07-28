@@ -35,6 +35,7 @@ from data.build import build_dataloaders
 from evaluation.coco_eval import evaluate, format_metrics
 from model.detection_loss import DetectionLoss
 from model.detector import SecureYOLO
+from model.transfer import log_transfer_report, transfer_state_dict
 
 logging.basicConfig(
     level=logging.INFO,
@@ -329,10 +330,22 @@ def main():
         # Prefer EMA weights as the starting point; they are what evaluation
         # selects on and are consistently the stronger of the two.
         state = ckpt.get("ema") or ckpt["model"]
-        missing, unexpected = model.load_state_dict(state, strict=False)
-        if missing or unexpected:
-            logger.warning("Loaded with %d missing and %d unexpected keys",
-                           len(missing), len(unexpected))
+        src_names = ckpt.get("class_names", [])
+
+        if src_names and len(src_names) != num_classes:
+            # Cross-dataset transfer. Backbone, neck, and box regression copy
+            # directly; the classification head is sliced per class by name so
+            # that classes present in both label sets keep their pretrained
+            # weights instead of being relearned from scratch.
+            state, report = transfer_state_dict(state, model, src_names, class_names)
+            log_transfer_report(report, src_names, class_names)
+            model.load_state_dict(state)
+        else:
+            missing, unexpected = model.load_state_dict(state, strict=False)
+            if missing or unexpected:
+                logger.warning("Loaded with %d missing and %d unexpected keys",
+                               len(missing), len(unexpected))
+
         if ema is not None:
             ema.ema.load_state_dict(model.state_dict())
         logger.info("Initialized from %s (epoch %s, %s weights); starting a fresh "
