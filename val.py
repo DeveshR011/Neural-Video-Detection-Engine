@@ -21,6 +21,7 @@ import torch
 
 from data.build import build_dataloaders
 from evaluation.coco_eval import evaluate, format_metrics
+from evaluation.tta import build_tta
 from model.detector import SecureYOLO
 
 logging.basicConfig(
@@ -72,6 +73,10 @@ def main():
     parser.add_argument("--iou", type=float, default=0.7, help="NMS IoU threshold")
     parser.add_argument("--max-det", type=int, default=300)
     parser.add_argument("--per-class", action="store_true")
+    parser.add_argument("--tta", default="off", choices=["off", "flip", "scale", "full"],
+                        help="test-time augmentation preset (costs extra forward passes)")
+    parser.add_argument("--tta-iou", type=float, default=0.65,
+                        help="IoU threshold used when merging TTA views")
     parser.add_argument("--raw-weights", action="store_true",
                         help="score the raw weights instead of the EMA average")
     parser.add_argument("--amp", default="bf16", choices=["bf16", "fp16", "off"])
@@ -105,11 +110,13 @@ def main():
                                 use_ema=not args.raw_weights,
                                 num_classes=bundle["num_classes"])
 
-    logger.info("Evaluating at %dpx | conf %.4f | NMS IoU %.2f | max_det %d",
-                imgsz, args.conf, args.iou, args.max_det)
+    logger.info("Evaluating at %dpx | conf %.4f | NMS IoU %.2f | max_det %d | TTA %s",
+                imgsz, args.conf, args.iou, args.max_det, args.tta)
+
+    eval_target = build_tta(model, mode=args.tta, merge_iou=args.tta_iou)
 
     metrics = evaluate(
-        model, bundle["val_loader"], bundle["gt_json"], bundle["id_map"], device,
+        eval_target, bundle["val_loader"], bundle["gt_json"], bundle["id_map"], device,
         class_names=bundle["class_names"], conf_threshold=args.conf,
         iou_threshold=args.iou, max_detections=args.max_det,
         amp_dtype=amp_dtype, per_class=args.per_class,

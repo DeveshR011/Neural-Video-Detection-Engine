@@ -258,7 +258,11 @@ def main():
     # Run control
     parser.add_argument("--name", default="exp")
     parser.add_argument("--project", default="runs")
-    parser.add_argument("--resume", default="", help="path to a checkpoint")
+    parser.add_argument("--resume", default="", help="continue a run, restoring optimizer and epoch")
+    parser.add_argument("--init-weights", default="",
+                        help="start a NEW run from these weights (model only, fresh "
+                             "schedule and optimizer). Use for fine-tuning; use "
+                             "--resume to continue an interrupted run.")
     parser.add_argument("--eval-interval", type=int, default=5)
     parser.add_argument("--save-interval", type=int, default=10)
     parser.add_argument("--log-interval", type=int, default=50)
@@ -316,6 +320,25 @@ def main():
     ema = None if args.no_ema else ModelEMA(model)
 
     start_epoch, best_map = 0, 0.0
+
+    if args.init_weights:
+        if args.resume:
+            raise SystemExit("--init-weights and --resume are mutually exclusive: "
+                             "one starts a new schedule, the other continues an old one.")
+        ckpt = torch.load(args.init_weights, map_location=device, weights_only=False)
+        # Prefer EMA weights as the starting point; they are what evaluation
+        # selects on and are consistently the stronger of the two.
+        state = ckpt.get("ema") or ckpt["model"]
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing or unexpected:
+            logger.warning("Loaded with %d missing and %d unexpected keys",
+                           len(missing), len(unexpected))
+        if ema is not None:
+            ema.ema.load_state_dict(model.state_dict())
+        logger.info("Initialized from %s (epoch %s, %s weights); starting a fresh "
+                    "%d-epoch schedule", args.init_weights, ckpt.get("epoch", "?"),
+                    "EMA" if ckpt.get("ema") else "raw", args.epochs)
+
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
