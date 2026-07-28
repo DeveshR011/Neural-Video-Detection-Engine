@@ -1,546 +1,277 @@
-# 🛡️ Neural Video Detection Engine
+# Neural Video Detection Engine
 
-### Local, Security-Oriented Object Detection (Research Prototype)
+Anchor-free object detector with a hybrid CNN + attention backbone, trained
+and evaluated end-to-end on a single 6 GB laptop GPU. Includes an on-device
+security layer (model encryption, integrity hashing, audit logging) that sits
+outside the inference path and therefore costs no accuracy.
 
-A security-oriented detector prototype that runs fully on-device and combines object detection with encryption, integrity checks, and runtime hardening experiments.
+**82.6 mAP@0.5 on PASCAL VOC2007 test** — trained in 10 GPU-hours on an RTX
+4050 Laptop (6 GB), ImageNet-pretrained backbone, detector trained from
+random init.
 
-> Status: core detector/training/inference path is implemented, but several subsystems are still experimental or stubbed. See feature status below.
-
----
-
-## Feature Status (Honest Partition)
-
-### Implemented
-
-- Multi-scale detector architecture (CSP + BiFPN heads) with YOLO-style decode + NMS in inference
-- End-to-end training loop with detection losses, checkpoint save/resume, and optional adversarial batches
-- Secure model encryption/decryption path (AES-GCM, device-bound AAD)
-- Runtime integrity hash registry and secure logging pipeline
-- Dataset integrity checks for COCO file presence and missing image detection
-
-### Experimental (Not Security-Critical Guarantees)
-
-- Architecture morphing: disabled by default; no strict output-invariance guarantee
-- Temporal smoothing and adversarial preprocessing as robustness experiments
-- Benchmark stress tests on synthetic inputs for performance only (not quality claims)
-- Structured pruning rewrite path is feature-gated off by default for safety
-
-### Stubbed / Placeholder
-
-- SGX/SEV enclave backends are interface-level placeholders, not production enclave implementations
-- Security benchmark sections that require certified hardware trust chains
+Engineering notes on three silent-correctness bugs found and fixed during the
+rewrite are in [TECHNICAL_NOTES.md](TECHNICAL_NOTES.md).
 
 ---
 
-## Table of Contents
+## Results
 
-- [Architecture Overview](#architecture-overview)
-- [Model Architecture — SecureYOLO v3](#model-architecture--secureyolo-v3)
-- [Security Architecture](#security-architecture)
-- [Training Pipeline](#training-pipeline)
-- [Hyperparameters](#hyperparameters)
-- [Getting Started](#getting-started)
-- [Project Structure](#project-structure)
+VOC2007 test (4,952 images), trained on VOC2007 + VOC2012 trainval (16,551
+images). Metric is COCO-style AP via `pycocotools`.
 
----
+| Configuration | mAP@[.5:.95] | mAP@.5 | mAP@.75 | FPS |
+|---|---:|---:|---:|---:|
+| Base (epoch 60, EMA) | 0.6092 | 0.8102 | 0.6668 | 87.1 |
+| \+ flip TTA | 0.6213 | 0.8232 | 0.6799 | 44.7 |
+| **\+ multi-scale TTA** | **0.6343** | **0.8264** | **0.6996** | 14.1 |
 
-## Architecture Overview
+Object-size breakdown at the best setting: small **0.1396**, medium 0.3964,
+large **0.7241**. Small-object AP is the binding constraint on the headline
+number.
 
-```mermaid
-graph TD
-    classDef secure fill:#2d3748,stroke:#4fd1c5,stroke-width:2px,color:#fff;
-    classDef ml fill:#2b6cb0,stroke:#63b3ed,stroke-width:2px,color:#fff;
-    classDef storage fill:#742a2a,stroke:#fc8181,stroke-width:2px,color:#fff;
+### How this compares
 
-    A[Encrypted Video Store<br/>AES-256]:::storage -->|Device-Bound Key| B(In-Memory Decryption<br/>VirtualLock Enclave):::secure
-    
-    subgraph Preprocessing
-    B --> C{Adversarial Defenses}:::secure
-    C -->|Scale| D[Random Resize]:::secure
-    C -->|Quality| E[JPEG Jitter]:::secure
-    C -->|Signal| F[Gaussian Noise]:::secure
-    end
+Published VOC2007 test results using the same protocol — ImageNet-pretrained
+backbone, detector trained from random init:
 
-    D & E & F --> G[SecureYOLO v3 Model<br/>CSP + BiFPN]:::ml
+| Model | mAP@0.5 |
+|---|---:|
+| Faster R-CNN (VGG16) | 73.2 |
+| SSD300 | 74.3 |
+| Faster R-CNN (ResNet-101) | 76.4 |
+| YOLOv2 544 | 78.6 |
+| SSD512 | 79.8 |
+| YOLOv3 | ~80.3 |
+| R-FCN (ResNet-101) | 80.5 |
+| DSSD513 | 81.5 |
+| RefineDet512 | 81.8 |
+| **This work** | **82.6** |
+| RefineDet512+ (multi-scale test) | 83.8 |
 
-    subgraph "Neural Inference (FP16)"
-    G --> H(Feature Denoising):::ml
-    H --> I(Random Projection Head):::secure
-    I --> J[Multi-Scale Detection<br/>P3, P4, P5]:::ml
-    end
+**Two caveats, stated plainly:**
 
-    J --> K{Confidence Filtering}:::ml
-    K -->|OOD Det.| L[Temporal Smoothing<br/>EMA + Box Momentum]:::ml
+1. Results in the **88–92** range reported for YOLOv5/v8 on VOC start from a
+   **COCO-pretrained detector** and fine-tune on VOC. That transfers detection
+   knowledge from 118k images across 80 classes. This model starts from an
+   ImageNet-classification backbone with the detector head randomly
+   initialized. The numbers are not comparable, and the table above
+   deliberately lists only same-protocol results.
+2. This reports **COCO-style AP50** via `pycocotools` on VOC data. The official
+   VOC metric uses different interpolation. The two typically agree within
+   ~1 point but are not identical.
 
-    L --> M[Secure Output Buffer]:::secure
-    L -.->|Trigger| N("Memory Wipe<br/>.zero_()"):::secure
-    L -.->|Log| O(Hash-Chain Audit Log<br/>HMAC-SHA256):::secure
-```
-
----
-
-## Model Architecture — SecureYOLO v3
-
-### Why This Architecture?
-
-Traditional YOLO models prioritize speed but lack security considerations. SecureYOLO v3 is designed from the ground up to be **secure-by-construction**: every intermediate tensor is wipeable, every activation is in-place, and the feature space is cryptographically obfuscated.
-
-### Backbone: Cross Stage Partial (CSP) Network
-
-### Backbone: Cross Stage Partial (CSP) Network
-
-The backbone utilizes **CSP blocks**, a powerful technique derived from CSPNet (Wang et al., 2020). By partitioning the feature map into two distinct gradient paths, CSP eliminates computational bottlenecks and avoids the duplicated gradient information that plagues standard ResNet architectures.
-
-```mermaid
-graph LR
-    classDef base fill:#2c5282,stroke:#63b3ed,stroke-width:2px,color:#fff;
-    classDef split fill:#276749,stroke:#68d391,stroke-width:2px,color:#fff;
-    
-    In[Input]:::base --> S[Split Channels in Half]:::split
-    
-    S -->|Branch 1: C/2| B1(Conv 1x1):::base
-    B1 --> B2(Depthwise Separable 3x3):::base
-    B2 --> B3(Residual Add):::base
-    
-    S -->|Branch 2: C/2| Skip(Skip Connection):::base
-    
-    B3 --> Concat{Concatenate}:::split
-    Skip --> Concat
-    
-    Concat --> Out[Conv 1x1 Output]:::base
-```
-
-**Why CSP?**
-- **Richer gradient flow**: Both branches contribute different gradient information, reducing vanishing gradient issues
-- **Lower compute**: Only half the channels go through the expensive bottleneck path
-- **Better feature reuse**: The skip branch preserves low-level features
-
-**Depthwise Separable Convolutions** factorize standard 3×3 convolutions into:
-1. **Depthwise**: One 3×3 filter per channel (spatial filtering)
-2. **Pointwise**: 1×1 conv to mix channels
-
-This reduces FLOPs by ~8× compared to standard convolutions at equivalent channel widths.
-
-### Neck: Bidirectional Feature Pyramid Network (BiFPN)
-
-### Neck: Bidirectional Feature Pyramid Network (BiFPN)
-
-In contrast to conventional Top-Down Feature Pyramid Networks (FPNs), this architecture implements a **BiFPN** (EfficientDet, 2020). BiFPN introduces rapid bottom-up path aggregations and **learnable scalar weights** for each connection, allowing the network to mathematically decide which spatial scales are most important for the specific image being processed.
-
-```mermaid
-graph TD
-    classDef node fill:#4a5568,stroke:#a0aec0,stroke-width:2px,color:#fff;
-    
-    subgraph "Backbone Outputs"
-        P5_in[P5: 20x20]:::node
-        P4_in[P4: 40x40]:::node
-        P3_in[P3: 80x80]:::node
-    end
-    
-    subgraph "Top-Down (TD) Path"
-        P5_td((P5_td)):::node
-        P4_td((P4_td)):::node
-        P3_td((P3_td)):::node
-    end
-    
-    subgraph "Bottom-Up (Out) Path"
-        P5_out[P5_OUT]:::node
-        P4_out[P4_OUT]:::node
-        P3_out[P3_OUT]:::node
-    end
-    
-    P5_in --> P5_td
-    P5_td -->|Upsample| P4_td
-    P4_in --> P4_td
-    
-    P4_td -->|Upsample| P3_td
-    P3_in --> P3_td
-    
-    P3_td --> P3_out
-    P3_out -->|Downsample| P4_out
-    P4_td --> P4_out
-    P4_in --> P4_out
-    
-    P4_out -->|Downsample| P5_out
-    P5_in --> P5_out
-    P5_td --> P5_out
-```
-
-Each fusion node computes:
-```
-output = Conv(Σ wᵢ·Fᵢ / Σ wᵢ)   where wᵢ = ReLU(learnable_weight)
-```
-
-**Why BiFPN?**
-- **Bidirectional**: Information flows both ways, improving multi-scale feature quality
-- **Learnable weights**: The network learns which scale features matter more at each fusion point
-- **Efficient**: Uses depthwise-separable convolutions in fusion nodes
-
-### Feature Denoising Blocks
-
-Each BiFPN output passes through a **Feature Denoising Block**:
-```
-input → Conv1×1 → BN → SiLU → + input (residual)
-```
-
-This acts as a learned low-pass filter in feature space, suppressing high-frequency adversarial perturbations while preserving detection-relevant features (He et al., "Non-local Means Denoising").
-
-### Detection Heads (Multi-Scale)
-
-Three separate detection heads at different spatial resolutions:
-
-| Head | Feature Map | Detects | Anchors |
-|------|------------|---------|---------|
-| P3 (80×80) | High-res | Small objects (pedestrians, signs) | 3 |
-| P4 (40×40) | Mid-res | Medium objects (cars, dogs) | 3 |
-| P5 (20×20) | Low-res | Large objects (trucks, buildings) | 3 |
-
-Each anchor predicts **85 values** (for COCO 80-class):
-- `(x, y, w, h)` — bounding box coordinates (center + size)
-- `objectness` — probability that an object exists
-- `class_1 ... class_80` — per-class probability scores
-
-### Random Projection Head (Security)
-
-Before the detection heads, a **frozen random projection** (initialized from a secret seed, never trained) linearly transforms the feature space:
-
-```
-projected = W_random · features   (W_random is frozen, secret-seeded)
-```
-
-This ensures that even if an attacker intercepts the feature map, the learned representation geometry is hidden behind a secret linear transform.
-
-### Model Statistics
-
-| Metric | Value |
-|--------|-------|
-| Total Parameters | 2,735,607 |
-| Trainable Parameters | ~2.7M |
-| Frozen Parameters (projection) | ~16K |
-| Parameter Memory | 10.9 MB |
-| Input Resolution | 640×640 |
-| Output Scales | 3 (80×80, 40×40, 20×20) |
-| Total Anchor Predictions | 25,200 |
+Raw metrics and the full training curve are in [`results/`](results/).
 
 ---
 
-## Security Architecture
+## Architecture
 
-### 10-Phase Secure Lifecycle
+```
+input 640x640
+  │
+  ├─ Backbone ── timm model, ImageNet-pretrained (default resnet34)
+  │              returns P3/8, P4/16, P5/32
+  │                        │
+  │                        └─ C2PSA attention on P5 only
+  │
+  ├─ Neck ────── BiFPN, learnable weighted fusion, 2 bidirectional passes
+  │
+  └─ Head ────── decoupled, anchor-free
+                   cls branch → [B, nc, A]
+                   reg branch → [B, 4*(reg_max), A]   DFL distribution
+                   decode: ltrb distances from cell centre × stride
+```
 
-| Phase | Component | Function |
-|-------|-----------|----------|
-| 1 | Device Key Derivation | TPM-sealed or HKDF from hardware fingerprint |
-| 2 | Secure Enclave | Process-level secure memory wrapper (not production SGX/SEV) |
-| 3 | Hash-Chain Logging | HMAC-SHA256 tamper-evident audit trail |
-| 4 | Encrypted Model Load | AES-256-GCM with device-bound AAD |
-| 5 | Neural Watermarking | Cryptographic signature in weight space |
-| 6 | Architecture Morphing (Experimental) | Disabled by default; no invariance guarantee |
-| 7 | Runtime Integrity | Probabilistic SHA-256 layer hashing |
-| 8 | Secure Pipeline | All defenses active, AMP inference |
-| 9 | Benchmarking | Performance + optional real-data quality eval |
-| 10 | Secure Shutdown | 3-pass memory wipe, secret destruction |
+### Why a CNN backbone with attention only at P5
 
-### Key Security Properties
+A plain ViT backbone is the wrong choice under these constraints:
 
-- **Device-Bound Encryption**: Model and video keys are derived from hardware fingerprint — stolen files cannot be decrypted on another device
-- **Architecture Morphing (Experimental)**: Available only behind explicit opt-in and should not be treated as output-preserving for this topology
-- **Memory Protection**: All intermediate tensors are `.zero_()`'d immediately after use; VirtualLock prevents paging to disk
-- **Constant-Time Crypto**: All security comparisons use `hmac.compare_digest` to prevent timing attacks
+- **Memory.** Attention at 640² is 1600 tokens; activations exceed 6 GB at
+  usable batch sizes. Dropping to 384px costs more accuracy than the backbone
+  gains.
+- **Data appetite.** ViTs lack locality and translation-equivariance priors.
+  ViTDet's results come from MAE self-supervised pretraining plus 100 epochs
+  on full COCO. On 16.5k images for 10 hours, a ViT lands below a pretrained
+  CNN.
+- **Precedent.** Every detector on the real-time speed/accuracy Pareto front —
+  YOLOv8/v10/v11, RT-DETR — uses a convolutional backbone. RT-DETR applies its
+  transformer only in the encoder, not the backbone.
+
+Attention *is* worth it at low resolution late in the network. At P5 a 640px
+input is 20×20 = 400 tokens, so global context is cheap exactly where it helps
+most. This mirrors YOLOv11's C2PSA and RT-DETR's AIFI-on-P5.
+
+### Key design choices
+
+| Component | Choice | Rationale |
+|---|---|---|
+| Box regression | DFL, `reg_max=16` | Predicts a distribution over offsets; its expectation gives sub-cell accuracy and represents boundary ambiguity |
+| Assignment | Task-Aligned Assigner, `topk=10`, `α=0.5`, `β=6.0` | Scores pairs by `s^α · u^β`, coupling classification confidence to localization quality. Positives exist from step 1 |
+| Box loss | CIoU + DFL | Standard for this detector class |
+| Cls loss | BCE over alignment-normalized soft targets | No objectness branch; class score doubles as confidence |
+| Weight averaging | EMA, decay 0.9999 with ramp | Consistently worth 1–2 mAP |
+| Precision | bf16 autocast | No loss scaling needed on sm_89; ~1.8× throughput |
+| NMS | `torchvision.ops.batched_nms` | Replaces a per-class Python loop |
+
+Backbones are swappable via `--backbone` (any `timm` name). Measured on the
+RTX 4050 at 640px, batch 16:
+
+| Backbone | Params | Throughput | Peak VRAM | Pretrained |
+|---|---:|---:|---:|:--:|
+| `builtin` (CSP) | 8.2M | 56.8 img/s | 1.87 GB | ✗ |
+| **`resnet34`** | 24.4M | 32.1 img/s | 2.35 GB | ✓ |
+| `efficientnet_b0` | 6.0M | 29.6 img/s | 3.88 GB | ✓ |
+| `cspresnet50` | 26.7M | 26.1 img/s | 4.32 GB | ✓ |
+| `convnext_tiny` | 32.2M | 14.2 img/s | 5.43 GB | ✓ |
 
 ---
 
-## Training Pipeline
+## Getting started
 
-### Loss Functions: The Physics of Detection
-
-Our secure architecture abandons naive L1/L2 bounding box losses in favor of geometric, distribution-aware metrics. This is crucial for maintaining mAP while the architecture morphs per-session.
-
-| Loss | Theoretical Mechanics | Security / Performance Impact |
-|------|-----------------------|-------------------------------|
-| **CIoU (Complete IoU)** | Evaluates overlap, center-point distance (`ρ²(b,b_gt) / c²`), and aspect ratio consistency (`v = 4/π² * (arctan(w_gt/h_gt) - arctan(w/h))²`). | Forces gradients to behave smoothly even when predicted boxes do not overlap ground truth at all, stabilizing early-epoch training. |
-| **Focal Loss** | Modulates Cross-Entropy: `FL = -α_t(1-p_t)^γ * log(p_t)`. We use `γ=2.0`. | Solves the intense foreground/background imbalance inherent in anchor-based detection (25,200 background predictions vs 3-5 real objects). |
-| **Varifocal** | Asymmetric focal weighted by IoU quality of the prediction. | Improves calibration by forcing the classification score to directly correlate with the bounding box localization quality. |
-| **Temporal Jitter** | `λ * MSE(box_t, box_{t-1})` computed continuously during the forward pass. | Inherently regularizes the network to produce smooth trajectories in video feeds without requiring external tracking algorithms (like DeepSORT). |
-
-**Combined mathematical objective**: 
-```math
-L = \lambda_{box} \cdot L_{CIoU} + \lambda_{cls} \cdot L_{Focal} + \lambda_{obj} \cdot L_{BCE} + \lambda_{jitter} \cdot L_{Temporal}
-```
-
-### Adversarial Training: Hardening the Geometry
-
-To counteract Projected Gradient Descent (PGD) and Fast Gradient Sign Attacks (FGSM), 50% of all training batches undergo dynamic, on-the-fly adversarial perturbation.
-
-**The PGD Optimization Step:**
-```math
-x_{t+1} = \Pi_{x+S} (x_t + \alpha \cdot sign(\nabla_x L(\theta, x, y)))
-```
-We use a lightweight 3-step variant (ε=2/255). By injecting these algorithmically generated worst-case images into the training pipeline, the model learns a much smoother, Lipschitz-continuous classification boundary.
-
-**Input Gradient Regularization**: 
-We further constrain the network by explicitly penalizing the magnitude of its input gradients: `λ * ‖∂L/∂x‖₂`. This forces the loss landscape surrounding a valid image to be "flat," meaning small adversarial perturbations have mathematically zero impact on the final logit outputs.
-
-### Temporal Smoothing
-
-Two-stage inference-time stabilization:
-
-1. **EMA Logit Smoother**: `ŷ_t = α·y_t + (1-α)·ŷ_{t-1}` (α=0.3)
-2. **Box Momentum Tracker**: IoU-matched box smoothing with momentum=0.7
-
-### Compression (Optional)
-
-- **Structured Pruning (Feature-Gated)**: Disabled by default because unsafe channel rewrites can break multi-branch topology
-- **Knowledge Distillation**: KL-div + feature MSE from larger teacher
-- **QAT**: INT8-ready via fake-quantize observers
-
----
-
-## Hyperparameters
-
-### Architecture
-
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| `num_classes` | 80 | COCO object categories |
-| `fpn_channels` | 128 | Feature pyramid channel width |
-| `backbone_widths` | [32, 64, 128, 256, 512] | Per-stage channel widths |
-| `csp_bottlenecks` | [1, 2, 2, 1] | Bottleneck count per CSP stage |
-| `csp_expansion` | 0.5 | Bottleneck hidden dim ratio |
-| `anchors_per_scale` | 3 | Anchors per grid cell |
-
-### Training
-
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| `learning_rate` | 1e-3 | Initial LR (cosine decay) |
-| `weight_decay` | 5e-4 | L2 regularization |
-| `batch_size` | 16 | Per-GPU batch size |
-| `epochs` | 300 | Training epochs |
-| `warmup_epochs` | 3 | Linear LR warmup |
-| `input_size` | 640×640 | Fixed resolution |
-| `λ_box` | 5.0 | Box loss weight |
-| `λ_cls` | 1.0 | Classification loss weight |
-| `λ_obj` | 1.0 | Objectness loss weight |
-| `λ_jitter` | 0.1 | Temporal jitter penalty |
-| `focal_alpha` | 0.25 | Focal loss balance factor |
-| `focal_gamma` | 2.0 | Focal loss focusing parameter |
-
-### Adversarial Training
-
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| `pgd_epsilon` | 2/255 | Max L∞ perturbation |
-| `pgd_alpha` | 0.5/255 | PGD step size |
-| `pgd_steps` | 3 | PGD iterations (lightweight) |
-| `adversarial_ratio` | 0.5 | Fraction of adversarial batches |
-| `grad_reg_weight` | 0.1 | Input gradient penalty |
-| `label_smoothing` | 0.1 | Soft label factor |
-
-### Security
-
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| `integrity_check_probability` | 0.05 | Per-step layer hash check chance |
-| `integrity_check_interval` | 10 | Frames between integrity checks |
-| `timing_target_ms` | 15.0 | Constant-time inference target |
-| `timing_jitter_ms` | 2.0 | Random timing noise range |
-| `ema_alpha` | 0.3 | Temporal smoothing weight |
-| `box_momentum` | 0.7 | Box tracker smoothing |
-
----
-
-## How It Works
-
-### Inference Flow (Step by Step)
-
-1. **Video Decryption**: AES-256-GCM decryption in locked memory with device-bound AAD
-2. **Frame Extraction**: Raw pixels extracted to a secure buffer (never written to disk)
-3. **Adversarial Preprocessing**:
-   - Random resize (0.9×-1.1×) → destroys pixel-precise adversarial patterns
-   - JPEG compression jitter (quality 70-95) → removes high-frequency perturbations
-   - Gaussian noise injection (σ=0.01) → diffuses remaining adversarial signal
-4. **CUDA Noise Injection**: Dummy kernels launched on separate streams to mask power/EM signatures
-5. **Neural Inference** (FP16 mixed precision):
-   - CSP backbone extracts multi-scale features
-   - BiFPN fuses features bidirectionally
-   - Feature denoising suppresses adversarial residuals
-   - Random projection obfuscates feature geometry
-   - 3 detection heads produce 25,200 anchor predictions
-6. **Timing Normalization**: Inference padded to constant ~15ms via busy-wait + random jitter
-7. **Confidence Filtering**: Low-confidence predictions zeroed (threshold=0.5)
-8. **Temporal Smoothing**: EMA + box momentum stabilize detections across frames
-9. **Temporal Consistency Check**: IoU-based anomaly detection flags adversarial video injection
-10. **Runtime Integrity**: Probabilistic SHA-256 re-hash of model layers
-11. **Secure Cleanup**: All intermediate tensors `.zero_()`'d and deallocated
-12. **Forensic Logging**: HMAC-SHA256 hash-chain entry per inference event
-
-### Training Flow
-
-```
-for epoch in range(300):
-    for images, targets in dataloader:
-        
-        # 50% chance: generate PGD adversarial examples
-        if random() < 0.5:
-            images = PGD_attack(images, epsilon=2/255, steps=3)
-        
-        # Label smoothing (1.0 → 0.9, 0.0 → 0.001)
-        targets = smooth_labels(targets)
-        
-        # Forward pass (FP16 mixed precision)
-        with autocast():
-            predictions = model(images)
-            
-            loss = 5.0 * CIoU(pred_boxes, gt_boxes)
-                 + 1.0 * FocalLoss(pred_classes, gt_classes)
-                 + 1.0 * BCE(pred_objectness, gt_objectness)
-                 + 0.1 * JitterPenalty(pred_boxes, prev_boxes)
-        
-        # Input gradient regularization
-        loss += 0.1 * ||∂loss/∂images||₂
-        
-        # Backward + update
-        scaler.scale(loss).backward()
-        clip_grad_norm_(model.parameters(), 10.0)
-        scaler.step(optimizer)
-```
-
----
-
-## Getting Started
-
-### Requirements
+Requires Python 3.12+ and a CUDA-capable GPU (CPU works but is impractically
+slow for training).
 
 ```bash
 pip install -r requirements.txt
 ```
 
-**Dependencies**: PyTorch ≥2.0, cryptography, numpy, opencv-python, psutil, Pillow
-
-### Run Inference Demo
+Download PASCAL VOC (~2.9 GB, resumable):
 
 ```bash
-python main.py
+python scripts/download_voc.py --root ./VOCdevkit
 ```
 
-This executes the full lifecycle and writes benchmark output to `secure_enclave/ml_benchmark_results.json`.
-
-### Quick Smoke Test
+Train:
 
 ```bash
-python quick_test.py
+python train.py --dataset voc --data-root ./VOCdevkit --backbone resnet34 --size s --imgsz 640 --batch 16 --accumulate 4 --epochs 120 --eval-interval 20 --name voc120
 ```
 
-This verifies core model forward/predict, watermarking, and integrity registration without running a long benchmark.
-
-### Train on COCO (Reproducible)
-
-Recommended (if your local dataset currently has only `val2017` images):
+Evaluate a checkpoint, with test-time augmentation and a per-class breakdown:
 
 ```bash
-python train.py --data coco --train-split val --epochs 50 --batch-size 16 --device cuda --workers 4 --seed 42 --adversarial-finetune-ratio 0.2
+python val.py --weights runs/voc120/best.pt --dataset voc --data-root ./VOCdevkit --tta full --per-class
 ```
 
-Full training (when `train2017` images and `instances_train2017.json` are both complete):
+Run the tests:
 
 ```bash
-python train.py --data coco --train-split train --epochs 300 --batch-size 16 --device cuda --workers 4 --seed 42 --adversarial-finetune-ratio 0.2
+python -m pytest tests/ -v
 ```
 
-Resume a run:
+### Useful flags
 
-```bash
-python train.py --data coco --train-split val --device cuda --resume checkpoints/epoch_20.pt --epochs 100 --seed 42
-```
+| Flag | Purpose |
+|---|---|
+| `--accumulate N` | Gradient accumulation; effective batch = `batch × N`. Reaches large effective batches on small VRAM |
+| `--time-budget H` | Stop cleanly after H hours, writing a resumable checkpoint |
+| `--resume PATH` | Continue an interrupted run. Refuses to start if schedule- or architecture-critical flags differ |
+| `--init-weights PATH` | Start a **new** schedule from existing weights (fine-tuning) |
+| `--close-mosaic N` | Disable mosaic for the final N epochs |
+| `--tta {off,flip,scale,full}` | Test-time augmentation at evaluation |
+| `--secure-features` | Enable the random projection layer (**reduces mAP**) |
 
-### Run Benchmarks Only (Performance + Optional Real Quality)
-
-```bash
-python -c "
-from model.detector import SecureYOLO
-from benchmarks.benchmark import BenchmarkSuite
-import torch
-
-model = SecureYOLO(80).to('cuda')
-bench = BenchmarkSuite(model, torch.device('cuda'))
-bench.run_all(num_frames=100, eval_data_root='coco', eval_split='val', eval_max_images=100)
-bench.print_summary()
-"
-```
-
-If `eval_data_root` is not provided, quality metrics (mAP/precision/recall/ECE) are intentionally marked as skipped.
+Training splits cleanly across sessions: `--time-budget` stops at a wall-clock
+limit and `--resume` continues with the cosine schedule intact, since the
+schedule is computed from the total epoch count rather than the session.
 
 ---
 
-## Project Structure
+## Security layer
+
+This project began as a security-oriented detector. The features below are
+real and tested, but they operate at **checkpoint and API boundaries**, not
+inside the forward pass.
+
+### Implemented
+
+- **Model encryption** — AES-256-GCM with device-bound AAD (`crypto/`)
+- **Integrity registry** — per-parameter hashes, verified at load
+  (`security/runtime_integrity.py`)
+- **Hash-chain audit log** — HMAC-SHA256 chained entries (`security/secure_log.py`)
+- **Watermarking** — parameter-space watermark with verification; measured
+  90.5% bit accuracy at strength 0.001 (`model/watermark.py`)
+- **Side-channel mitigations** — timing noise injection, CUDA schedule
+  randomization (`security/side_channel.py`)
+
+### Experimental
+
+- Architecture morphing — disabled by default, no output-invariance guarantee
+- Adversarial training and preprocessing — available by flag, off for benchmarks
+- Structured pruning — feature-gated off
+- Random feature projection — opt-in via `--secure-features`, **costs mAP**
+
+### Stubs — not production implementations
+
+- **SGX / SEV enclave backends are interface-level placeholders.** They define
+  the API surface and do not provide hardware-backed isolation.
+- Security benchmarks requiring a certified hardware trust chain are not
+  implemented.
+
+### Effect on accuracy
+
+The original design applied a frozen random projection to P3/P4/P5 features
+and called `.zero_()` on live activations during inference. Both were removed
+from the forward pass: the projection degrades accuracy and only matters under
+a threat model where an adversary observes intermediate activations, and
+zeroing activations mutated tensors still referenced by autograd for no
+benefit. See [TECHNICAL_NOTES.md](TECHNICAL_NOTES.md) §4.
+
+**Every benchmark number in this README was produced with
+`secure_features=False`.** The security layer costs zero mAP.
+
+---
+
+## Project structure
 
 ```
-Neural Video Detection Engine/
-├── main.py                          # 10-phase boot-to-shutdown orchestrator
-├── train.py                         # Training script with adversarial training
-├── requirements.txt
-│
-├── model/
-│   ├── detector.py                  # SecureYOLO v3 (CSP + BiFPN + multi-scale)
-│   ├── losses.py                    # CIoU, Focal, Varifocal, Temporal Jitter
-│   ├── robustness.py                # FGSM/PGD generators, runtime defenses
-│   ├── adversarial_trainer.py       # Adversarial training loop
-│   ├── temporal.py                  # EMA logit smoother + box momentum
-│   ├── compression.py               # Pruning, distillation, QAT
-│   ├── calibration.py               # Temperature scaling, ECE, OOD detection
-│   └── watermark.py                 # Neural watermark embed/verify
-│
-├── crypto/
-│   ├── device_keys.py               # TPM/HKDF device-bound key derivation
-│   ├── model_cipher.py              # AES-256-GCM model encryption
-│   ├── video_cipher.py              # AES-256-GCM video encryption
-│   └── memory.py                    # Secure memory buffers (VirtualLock)
-│
-├── security/
-│   ├── enclave.py                   # Hardware/software enclave abstraction
-│   ├── enclave_memory.py            # Enclave-bound tensor allocator
-│   ├── architecture_morph.py        # Per-boot channel permutation (P·W·Pᵀ)
-│   ├── runtime_integrity.py         # Probabilistic layer hash verification
-│   ├── side_channel.py              # Timing noise, CUDA randomization
-│   └── secure_log.py                # HMAC hash-chain forensic logging
-│
-├── pipeline/
-│   └── runner.py                    # Integrated secure inference loop
-│
-├── benchmarks/
-│   └── benchmark.py                 # 7-dimension ML+Security evaluation
-│
-└── secure_enclave/                  # Runtime artifacts (encrypted model, logs)
+model/
+  detector.py        SecureYOLO: backbone + neck + head, predict, NMS, fusion
+  backbone.py        pluggable timm / builtin CSP backbone, P5 attention
+  neck.py            BiFPN with learnable weighted fusion
+  head.py            decoupled anchor-free head, DFL, anchor generation
+  assigner.py        Task-Aligned Assigner
+  detection_loss.py  CIoU + DFL + BCE, fully vectorized
+  losses.py          IoU-family metrics, focal / varifocal losses
+data/
+  dataset.py         COCO-JSON and VOC-XML readers, augmentation pipeline
+  transforms.py      letterbox, mosaic, mixup, affine, HSV
+  build.py           dataloader construction, COCO ground-truth export
+evaluation/
+  coco_eval.py       pycocotools mAP harness
+  tta.py             test-time augmentation
+security/, crypto/   encryption, integrity, audit logging, enclave stubs
+tests/               27 tests, including regressions for each fixed bug
+train.py             training entry point
+val.py               evaluation entry point
+scripts/             dataset downloaders
 ```
 
 ---
 
-## Benchmark Results
+## Known limitations
 
-Benchmark numbers depend heavily on hardware, runtime load, and whether quality evaluation uses real labeled data.
-Use the generated JSON artifact for current results:
+- **Small-object AP is 0.14 against 0.72 for large objects.** This is the
+  dominant term holding the headline number down. It is bounded by P3 stride
+  and 640px input, not by training length.
+- **Accuracy plateaued at epoch 40.** Epochs 40→78 moved mAP@0.5 by −0.04
+  while training loss fell from 3.35 to 2.89 — fitting without generalizing.
+  The limit is initialization and capacity, not schedule.
+- **VOC only.** COCO support is implemented and tested but no COCO training
+  run was performed; the 19 GB download plus ~10 h of training did not fit the
+  compute budget.
+- Enclave backends are stubs (see above).
 
-- `secure_enclave/ml_benchmark_results.json`
+### What would raise the number
 
-Interpretation guidance:
-
-- `latency` and `baseline_comparison` are performance-oriented.
-- `detection_quality`, `calibration`, and `adversarial_eval` are only meaningful when `eval_data_root` points to labeled data.
-
----
-
-## References
-
-- **CSPNet**: Wang et al., "CSPNet: A New Backbone that can Enhance Learning Capability of CNN" (CVPR 2020)
-- **BiFPN**: Tan et al., "EfficientDet: Scalable and Efficient Object Detection" (CVPR 2020)
-- **Focal Loss**: Lin et al., "Focal Loss for Dense Object Detection" (ICCV 2017)
-- **CIoU**: Zheng et al., "Distance-IoU Loss: Faster and Better Learning for Bounding Box Regression" (AAAI 2020)
-- **PGD Training**: Madry et al., "Towards Deep Learning Models Resistant to Adversarial Attacks" (ICLR 2018)
-- **Feature Denoising**: Xie et al., "Feature Denoising for Improving Adversarial Robustness" (CVPR 2019)
+| Change | Expected gain | Cost |
+|---|---|---|
+| COCO-pretrained detector initialization | +6–9 mAP | ~10 h COCO pretraining |
+| Higher input resolution (896px) | +1.5–2.5, mostly small objects | full retrain, smaller batch |
+| Larger backbone | +1–2 | ~14 h at 14 img/s |
 
 ---
 
 ## License
 
-Research use only. This system demonstrates the feasibility of secure, encrypted, adversarial-resilient local neural inference.
+Research prototype. See repository for details.
