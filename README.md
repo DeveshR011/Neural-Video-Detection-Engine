@@ -5,7 +5,7 @@ and evaluated end-to-end on a single 6 GB laptop GPU. Includes an on-device
 security layer (model encryption, integrity hashing, audit logging) that sits
 outside the inference path and therefore costs no accuracy.
 
-**82.6 mAP@0.5 on PASCAL VOC2007 test** — trained in 10 GPU-hours on an RTX
+**82.6 mAP@0.5 on PASCAL VOC2007 test**  trained in 10 GPU-hours on an RTX
 4050 Laptop (6 GB), ImageNet-pretrained backbone, detector trained from
 random init.
 
